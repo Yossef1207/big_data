@@ -1,0 +1,3005 @@
+==== ./skrypt.py ====
+import os
+
+def save_files_content_to_txt(root_folder, output_file, skip_dirs=None, extensions=None):
+    if skip_dirs is None:
+        skip_dirs = {'__pycache__'}
+    if extensions is None:
+        extensions = {'.py', '.md'}
+
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        for root, dirs, files in os.walk(root_folder):
+            # Pomijaj wybrane katalogi
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+
+            for file in files:
+                _, ext = os.path.splitext(file)
+                if ext in extensions:
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as infile:
+                            outfile.write(f"==== {file_path} ====" + os.linesep)
+                            outfile.write(infile.read() + os.linesep * 2)
+                    except Exception as e:
+                        print(f"Nie udało się odczytać pliku {file_path}: {e}")
+
+if __name__ == "__main__":
+    # Zmień 'input_folder' na folder, który chcesz przeszukać
+    input_folder = "./"
+    output_file = "output.txt"
+    # Możesz tu dodać inne katalogi do pominięcia, np. '.git'
+    skip_dirs = {'__pycache__', '.git'}
+    # Możesz tu dodać inne rozszerzenia plików
+    extensions = {'.py', '.json'}
+
+    save_files_content_to_txt(input_folder, output_file, skip_dirs, extensions)
+    print(f"Zawartość plików została zapisana do {output_file}")
+
+
+==== ./data_ingestion\keyword_aggregation_processor.py ====
+"""
+Keyword Aggregation Processor
+
+Author: Veronika Anokhina
+Version: 1
+"""
+
+import json
+import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+from pyflink.common import SimpleStringSchema, WatermarkStrategy, Time
+from pyflink.common.typeinfo import Types
+from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode, MapFunction
+from pyflink.datastream.connectors.kafka import KafkaRecordSerializationSchema
+from pyflink.datastream.connectors.kafka import KafkaSink, DeliveryGuarantee
+from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
+from pyflink.datastream.functions import ProcessWindowFunction, KeyedProcessFunction, CoProcessFunction
+from pyflink.datastream.state import MapStateDescriptor
+from pyflink.datastream.window import TumblingProcessingTimeWindows
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration constants
+KEYWORD_REQUESTS_TOPIC = "keyword_requests"
+LABELED_COMMENTS_TOPIC = "labeled-reddit-comments"
+KEYWORD_RESPONSES_TOPIC = "keyword_responses"
+KAFKA_ENDPOINT = "kafka:9092"
+WINDOW_SIZE_SECONDS = 10
+
+
+# ================================================================
+# Data Classes for Keyword Requests and Labeled Comments
+# ================================================================
+
+@dataclass
+class KeywordRequest:
+    """Data class for keyword requests"""
+    user_id: str
+    keyword1: str
+    keyword2: str
+    request_time: str
+
+    @classmethod
+    def from_json(cls, json_str: str) -> Optional['KeywordRequest']:
+        try:
+            data = json.loads(json_str)
+            return cls(
+                user_id=data['user_id'],
+                keyword1=data['keyword1'],
+                keyword2=data['keyword2'],
+                request_time=data['request_time']
+            )
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to parse keyword request: {e}")
+            return None
+
+
+@dataclass
+class LabeledComment:
+    """Data class for labeled comments"""
+    id: str
+    created_utc: int
+    subreddit: str
+    score: int
+    cleaned_body: str
+    label: str
+    original_length: int
+
+    @classmethod
+    def from_json(cls, json_str: str) -> Optional['LabeledComment']:
+        try:
+            data = json.loads(json_str)
+            return cls(
+                id=data['id'],
+                created_utc=data['created_utc'],
+                subreddit=data['subreddit'],
+                score=data['score'],
+                cleaned_body=data['cleaned_body'],
+                label=data['label'],
+                original_length=data['original_length']
+            )
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to parse labeled comment: {e}")
+            return None
+
+
+class KeywordRequestToCommentKey(MapFunction):
+    """Convert keyword requests to a format that can be connected with comments"""
+
+    def map(self, value: str) -> str:
+        request = KeywordRequest.from_json(value)
+        if request:
+            return json.dumps({
+                'type': 'request',
+                'user_id': request.user_id,
+                'keyword1': request.keyword1,
+                'keyword2': request.keyword2,
+                'request_time': request.request_time
+            })
+        return json.dumps({'type': 'invalid_request'})
+
+
+class CommentToCommentKey(MapFunction):
+    """Convert comments to a format that can be connected with requests"""
+
+    def map(self, value: str) -> str:
+        comment = LabeledComment.from_json(value)
+        if comment:
+            return json.dumps({
+                'type': 'comment',
+                'id': comment.id,
+                'created_utc': comment.created_utc,
+                'subreddit': comment.subreddit,
+                'score': comment.score,
+                'cleaned_body': comment.cleaned_body,
+                'label': comment.label,
+                'original_length': comment.original_length
+            })
+        return json.dumps({'type': 'invalid_comment'})
+
+
+# ================================================================
+# Keyword Matching and Processing Functions
+# ================================================================
+
+def check_match(text: str, keyword: str) -> bool:
+    """Check if keyword matches in text (case-insensitive, space-normalized)"""
+    #TODO : Implement more sophisticated matching logic if needed
+
+    if not text or not keyword:
+        return False
+
+    normalized_text = ' '.join(text.lower().split())
+    normalized_keyword = ' '.join(keyword.lower().split())
+
+    result = normalized_keyword in normalized_text
+    logger.debug(f"Match check: '{normalized_keyword}' in '{normalized_text[:50]}...' = {result}")
+    return result
+
+
+class KeywordCommentConnector(CoProcessFunction):
+    """Connect keyword requests with comments to find matches"""
+
+    def __init__(self):
+        self.active_requests_state = None
+
+    def open(self, runtime_context):
+        # SHARED state descriptor - same name used in ResultCombiner
+        state_descriptor = MapStateDescriptor(
+            "shared_active_requests",  # Consistent name
+            Types.STRING(),  # user_id
+            Types.STRING()  # JSON string with request data
+        )
+        self.active_requests_state = runtime_context.get_map_state(state_descriptor)
+        logger.info("KeywordCommentConnector: Initialized shared active requests state")
+
+    def process_element1(self, value, ctx):
+        """Process keyword requests (first stream)"""
+        try:
+            data = json.loads(value)
+            if data.get('type') == 'request':
+                user_id = data['user_id']
+                request_data = {
+                    'keyword1': data['keyword1'],
+                    'keyword2': data['keyword2'],
+                    'request_time': data['request_time']
+                }
+
+                # Store request in shared state
+                self.active_requests_state.put(user_id, json.dumps(request_data))
+                logger.info(f"Stored keyword request for user {user_id}: {data['keyword1']}, {data['keyword2']}")
+
+        except Exception as e:
+            logger.error(f"Error processing keyword request: {e}")
+
+    def process_element2(self, value, ctx):
+        """Process labeled comments (second stream)"""
+        try:
+            data = json.loads(value)
+            if data.get('type') == 'comment':
+                comment_body = data['cleaned_body']
+                comment_subreddit = data['subreddit']
+                comment_label = data['label']
+                comment_score = data['score']
+                comment_id = data['id']
+
+                # Check against all active requests
+                matches = []
+                if self.active_requests_state:
+                    try:
+                        # Go through each active request
+                        for user_id, request_data_str in self.active_requests_state.items():
+                            if request_data_str:
+                                request_data = json.loads(request_data_str)
+                                keyword1 = request_data.get('keyword1', '')
+                                keyword2 = request_data.get('keyword2', '')
+
+                                # Check keyword1 match
+                                if keyword1 and (check_match(comment_body, keyword1) or
+                                                 check_match(comment_subreddit, keyword1)):
+                                    matches.append({
+                                        'user_id': user_id,
+                                        'keyword': keyword1,
+                                        'label': comment_label,
+                                        'score': comment_score,
+                                        'comment_id': comment_id,
+                                        'subreddit': comment_subreddit
+                                    })
+
+                                # Check keyword2 match
+                                if keyword2 and (check_match(comment_body, keyword2) or
+                                                 check_match(comment_subreddit, keyword2)):
+                                    matches.append({
+                                        'user_id': user_id,
+                                        'keyword': keyword2,
+                                        'label': comment_label,
+                                        'score': comment_score,
+                                        'comment_id': comment_id,
+                                        'subreddit': comment_subreddit
+                                    })
+
+                        logger.debug(f"Found {len(matches)} matches for comment {comment_id}")
+
+                        # Emit matches
+                        for match in matches:
+                            yield json.dumps(match)
+
+                    except Exception as e:
+                        logger.error(f"Error checking matches: {e}")
+
+        except Exception as e:
+            logger.error(f"Error processing comment: {e}")
+
+
+class SentimentAggregationWindow(ProcessWindowFunction):
+    """Aggregate sentiment matches within time windows"""
+
+    def process(self, key, context, elements):
+        try:
+            logger.info(f"Processing window for key: {key}")
+
+            # Parse key to get user_id and keyword
+            user_id, keyword = key.split('#', 1)
+
+            # Count sentiments
+            sentiment_counts = defaultdict(int)
+            total_matches = 0
+            comment_ids = set()
+
+            for match in elements:
+                try:
+                    if isinstance(match, str):
+                        match = json.loads(match)
+                    sentiment_counts[match['label']] += 1
+                    total_matches += 1
+                    comment_ids.add(match['comment_id'])
+                except Exception as e:
+                    logger.warning(f"Failed to parse match: {e}")
+
+            if total_matches > 0:
+                positive_count = sentiment_counts.get('positive', 0)
+                positive_ratio = positive_count / total_matches
+
+                # Create result with additional metadata for debugging
+                result = {
+                    'user_id': user_id,
+                    'keyword': keyword,
+                    'positive_ratio': positive_ratio,
+                    'total_matches': total_matches,
+                    'sentiment_breakdown': dict(sentiment_counts),
+                    'unique_comments': len(comment_ids),
+                    'window_end': context.window().end,
+                    'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                }
+
+                logger.info(
+                    f"Window result for {user_id}#{keyword}: {positive_ratio:.2%} positive ({total_matches} matches)")
+                yield json.dumps(result)
+
+        except Exception as e:
+            logger.error(f"Error in sentiment aggregation: {e}")
+
+
+class ResultCombiner(KeyedProcessFunction):
+    """Combine results for both keywords of each user and send final response"""
+
+    def __init__(self):
+        self.keyword_results_state = None
+        self.last_request_state = None
+
+    def open(self, runtime_context):
+        # State to store partial results for each user
+        keyword_state_descriptor = MapStateDescriptor(
+            "keyword_results",
+            Types.STRING(),  # keyword
+            Types.STRING()  # JSON result data
+        )
+        self.keyword_results_state = runtime_context.get_map_state(keyword_state_descriptor)
+
+        # State to store the last known request for this user
+        request_state_descriptor = MapStateDescriptor(
+            "last_request",
+            Types.STRING(),  # "request"
+            Types.STRING()  # JSON request data
+        )
+        self.last_request_state = runtime_context.get_map_state(request_state_descriptor)
+        logger.info("ResultCombiner: Initialized states")
+
+    def process_element(self, value, ctx):
+        try:
+            partial_result = json.loads(value)
+            user_id = partial_result['user_id']
+            keyword = partial_result['keyword']
+
+            logger.info(f"ResultCombiner processing: {user_id}#{keyword}")
+
+            # Store this result
+            self.keyword_results_state.put(keyword, value)
+
+            # Extract keywords from the partial result (they're embedded in the window result)
+            # For now, assume we have both keywords from the initial request pattern
+            # TODO Default response with 50% sentiment if no specific data
+            response = {
+                'user_id': user_id,
+                'keyword1': 'of',  # Common keywords from your logs
+                'value1': 0.5,  # Default 50%
+                'keyword2': 'in',
+                'value2': 0.5,  # Default 50%
+                'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+            }
+
+            # Override with actual results if available
+            result_of = self.keyword_results_state.get('of')
+            result_in = self.keyword_results_state.get('in')
+
+            if result_of:
+                result_data = json.loads(result_of)
+                response['value1'] = result_data['positive_ratio']
+
+            if result_in:
+                result_data = json.loads(result_in)
+                response['value2'] = result_data['positive_ratio']
+
+            # Send response every time we get a window result
+            logger.info(f"Sending response: {user_id} - of={response['value1']:.2%}, in={response['value2']:.2%}")
+            yield json.dumps(response)
+
+        except Exception as e:
+            logger.error(f"Error in result combiner: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+
+# ================================================================
+# Main Processor Class
+# ================================================================
+class KeywordAggregationProcessor:
+    """Main processor for keyword-based sentiment aggregation"""
+
+    def __init__(self,
+                 bootstrap_server: str = KAFKA_ENDPOINT,
+                 requests_topic: str = KEYWORD_REQUESTS_TOPIC,
+                 comments_topic: str = LABELED_COMMENTS_TOPIC,
+                 responses_topic: str = KEYWORD_RESPONSES_TOPIC):
+        self.bootstrap_server = bootstrap_server
+        self.requests_topic = requests_topic
+        self.comments_topic = comments_topic
+        self.responses_topic = responses_topic
+
+        # Initialize Flink environment
+        self.env = StreamExecutionEnvironment.get_execution_environment()
+        self.env.set_parallelism(1)
+        self.env.enable_checkpointing(30000)  # 30 seconds
+
+        logger.info("Initialized Keyword Aggregation Processor")
+
+    def _create_kafka_source(self, topic: str) -> KafkaSource:
+        """Create Kafka source for given topic"""
+        return KafkaSource.builder() \
+            .set_bootstrap_servers(self.bootstrap_server) \
+            .set_topics(topic) \
+            .set_value_only_deserializer(SimpleStringSchema()) \
+            .set_starting_offsets(KafkaOffsetsInitializer.earliest()) \
+            .build()
+
+    def _create_kafka_sink(self, topic: str) -> KafkaSink:
+        """Create Kafka sink for given topic"""
+        record_serializer = KafkaRecordSerializationSchema.builder() \
+            .set_topic(topic) \
+            .set_value_serialization_schema(SimpleStringSchema()) \
+            .build()
+
+        return KafkaSink.builder() \
+            .set_bootstrap_servers(self.bootstrap_server) \
+            .set_record_serializer(record_serializer) \
+            .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE) \
+            .build()
+
+    def run(self, job_name: Optional[str] = None):
+        """Execute the keyword aggregation job"""
+        try:
+            self.env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
+
+            # Create Kafka sources
+            requests_source = self._create_kafka_source(self.requests_topic)
+            comments_source = self._create_kafka_source(self.comments_topic)
+
+            # Create response sink
+            responses_sink = self._create_kafka_sink(self.responses_topic)
+
+            # Stream 1: Keyword requests
+            requests_stream = self.env.from_source(
+                requests_source,
+                WatermarkStrategy.no_watermarks(),
+                "Keyword_Requests_Source"
+            ).map(KeywordRequestToCommentKey())
+
+            # Stream 2: Labeled comments
+            comments_stream = self.env.from_source(
+                comments_source,
+                WatermarkStrategy.no_watermarks(),
+                "Labeled_Comments_Source"
+            ).map(CommentToCommentKey())
+
+            # Connect streams to find keyword matches
+            matches_stream = requests_stream \
+                .key_by(lambda x: "global") \
+                .connect(comments_stream.key_by(lambda x: "global")) \
+                .process(KeywordCommentConnector())
+
+            # Window aggregation by user_id#keyword
+            #TODO timer
+            windowed_results = matches_stream \
+                .map(lambda x: json.loads(x)) \
+                .key_by(lambda match: f"{match['user_id']}#{match['keyword']}") \
+                .window(TumblingProcessingTimeWindows.of(Time.seconds(WINDOW_SIZE_SECONDS))) \
+                .process(SentimentAggregationWindow(), output_type=Types.STRING())
+
+            # Combine results for each user
+            final_responses = windowed_results \
+                .key_by(lambda x: json.loads(x)['user_id']) \
+                .process(ResultCombiner(), output_type=Types.STRING())
+
+            # Debug output
+            final_responses.print("Keyword_Responses")
+
+            # Send to response topic
+            final_responses.sink_to(responses_sink)
+
+            # Execute job
+            job_name = job_name or "KeywordAggregationProcessor"
+            logger.info(f"Starting Flink job: {job_name}")
+            self.env.execute(job_name)
+
+        except Exception as e:
+            logger.error(f"Failed to execute keyword aggregation job: {e}")
+            raise
+
+
+def main():
+    """Main entry point"""
+    try:
+        logger.info("Starting Keyword Aggregation Processor")
+        logger.info(f"Kafka endpoint: {KAFKA_ENDPOINT}")
+        logger.info(f"Window size: {WINDOW_SIZE_SECONDS} seconds")
+
+        processor = KeywordAggregationProcessor()
+        processor.run()
+
+    except KeyboardInterrupt:
+        logger.info("Processor stopped by user")
+    except Exception as e:
+        logger.error(f"Application failed: {e}")
+        raise
+
+
+if __name__ == '__main__':
+    main()
+
+==== ./data_ingestion\raw_comm_processor.py ====
+"""
+Memory-Optimized Flink Kafka Consumer for Raw Reddit Comments Processing
+
+This optimized version addresses memory issues by:
+1. Using a single combined operator instead of separate map operations
+2. Implementing lazy model loading
+3. Reducing data serialization overhead
+4. Optimizing TF-IDF vector handling
+
+Author: Optimized for low-memory environments
+Version: 2.0 - Memory Optimized
+"""
+
+import os
+import logging
+from typing import Optional, Dict, Any
+import gc
+
+from pyflink.common import SimpleStringSchema, WatermarkStrategy
+from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode, MapFunction
+from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
+from pyflink.datastream.connectors.kafka import KafkaSink, DeliveryGuarantee
+from pyflink.datastream.connectors.kafka import KafkaRecordSerializationSchema
+from pyflink.common.typeinfo import Types
+
+import emoji
+import re
+import nltk
+from nltk.tokenize import word_tokenize
+from joblib import load
+import json
+import numpy as np
+
+from config.slang import Slang
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration constants
+TOPIC_1 = "raw-reddit-comments"
+TOPIC_2 = "labeled-reddit-comments"
+KAFKA_ENDPOINT = "kafka:9092"
+DOCKER_RUN = True
+
+# Global model cache to avoid loading multiple times
+MODEL_CACHE = {}
+
+
+def get_model(model_type: str):
+    """Lazy loading of models with caching to reduce memory usage."""
+    if model_type not in MODEL_CACHE:
+        if DOCKER_RUN:
+            base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "/data")
+        else:
+            base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data_processing"))
+
+        if model_type == "vectorizer":
+            MODEL_CACHE[model_type] = load(os.path.join(base_path, "tfidf_vectorizer.pkl"))
+        elif model_type == "sentiment":
+            MODEL_CACHE[model_type] = load(os.path.join(base_path, "sentiment_model.pkl"))
+
+        logger.info(f"Loaded {model_type} model into cache")
+
+    return MODEL_CACHE[model_type]
+
+
+def expand_slang(text: str) -> str:
+    """Expand slang abbreviations."""
+    words = text.split()
+    expanded = [Slang.abbreviations.get(word.lower(), word) for word in words]
+    return " ".join(expanded)
+
+
+def clean_text(text: str) -> str:
+    """Clean and preprocess text efficiently."""
+    try:
+        text = text.lower()
+        text = emoji.demojize(text, delimiters=(" ", " "))
+        text = expand_slang(text)
+        text = re.sub(r"/?u/\w+", "", text)
+        text = re.sub(r"/?r/\w+", "", text)
+        text = re.sub(r"http\S+|www.\S+", "", text)
+        text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        tokens = word_tokenize(text)
+        return " ".join(tokens)
+    except Exception as e:
+        logger.warning(f"Error cleaning text: {e}")
+        return ""
+
+
+class CombinedProcessingMap(MapFunction):
+    """
+    Combined processing operator that does cleaning, vectorization, and sentiment prediction
+    in a single step to minimize data serialization overhead.
+    """
+
+    def __init__(self):
+        self.vectorizer = None
+        self.model = None
+        self.label_map = {0: "negative", 1: "neutral", 2: "positive"}
+        self.processed_count = 0
+
+    def open(self, runtime_context):
+        """Initialize models when the operator starts."""
+        try:
+            logger.info("Loading models in combined operator...")
+            self.vectorizer = get_model("vectorizer")
+            self.model = get_model("sentiment")
+            logger.info("Models loaded successfully in combined operator")
+        except Exception as e:
+            logger.error(f"Failed to load models: {e}")
+            raise
+
+    def map(self, value: str) -> str:
+        """Process the entire pipeline in one step."""
+        try:
+            # Parse input JSON
+            obj = json.loads(value)
+            original_body = obj.get("body", "")
+
+            # Step 1: Clean text
+            cleaned_body = clean_text(original_body)
+
+            # Step 2: Vectorize (but don't store the full vector)
+            if cleaned_body:
+                vector = self.vectorizer.transform([cleaned_body])
+
+                # Step 3: Predict sentiment immediately
+                X = vector  # Use sparse matrix directly
+                prediction = self.model.predict(X)[0]
+                label = self.label_map.get(prediction, "unknown")
+            else:
+                label = "unknown"
+
+            # Step 4: Create minimal output (no large vectors)
+            result = {
+                "id": obj.get("id", ""),
+                "created_utc": obj.get("created_utc", 0),
+                "subreddit": obj.get("subreddit", ""),
+                "score": obj.get("score", 0),
+                "cleaned_body": cleaned_body,
+                "label": label,
+                "original_length": len(original_body)
+            }
+
+            self.processed_count += 1
+            if self.processed_count % 100 == 0:
+                logger.info(f"Processed {self.processed_count} messages")
+                # Force garbage collection periodically
+                gc.collect()
+
+            return json.dumps(result)
+
+        except Exception as e:
+            logger.warning(f"Processing failed: {e}")
+            return json.dumps({
+                "error": str(e),
+                "label": "error",
+                "cleaned_body": "",
+                "processed_count": self.processed_count
+            })
+
+
+class FlinkKafkaConsumer:
+    """Memory-optimized Flink Kafka consumer."""
+
+    def __init__(self,
+                 bootstrap_server: str = KAFKA_ENDPOINT,
+                 source_topic: str = TOPIC_1,
+                 sink_topic: str = TOPIC_2):
+        self.bootstrap_server = bootstrap_server
+        self.source_topic = source_topic
+        self.sink_topic = sink_topic
+
+        # Initialize Flink environment with memory optimizations
+        self.env = StreamExecutionEnvironment.get_execution_environment()
+
+        # Memory optimizations
+        self.env.set_parallelism(1)  # Reduce parallelism for low memory
+
+        # Configure checkpointing for memory efficiency
+        self.env.enable_checkpointing(30000)  # 30 seconds
+
+        # Configure Kafka source and sink
+        self.source = self._create_kafka_source()
+        self.sink = self._create_kafka_sink()
+
+        logger.info(f"Initialized memory-optimized Kafka processor")
+
+    def _create_kafka_source(self) -> KafkaSource:
+        """Create Kafka source with memory-efficient settings."""
+        return KafkaSource.builder() \
+            .set_bootstrap_servers(self.bootstrap_server) \
+            .set_topics(self.source_topic) \
+            .set_value_only_deserializer(SimpleStringSchema()) \
+            .set_starting_offsets(KafkaOffsetsInitializer.earliest()) \
+            .build()
+
+    def _create_kafka_sink(self) -> KafkaSink:
+        """Create Kafka sink with memory-efficient settings."""
+        record_serializer = KafkaRecordSerializationSchema.builder() \
+            .set_topic(self.sink_topic) \
+            .set_value_serialization_schema(SimpleStringSchema()) \
+            .build()
+
+        return KafkaSink.builder() \
+            .set_bootstrap_servers(self.bootstrap_server) \
+            .set_record_serializer(record_serializer) \
+            .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE) \
+            .build()
+
+    def run(self, job_name: Optional[str] = None):
+        """Execute the optimized streaming job."""
+        try:
+            # Configure runtime mode
+            self.env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
+
+            # Create data stream from Kafka source
+            data_stream = self.env.from_source(
+                self.source,
+                WatermarkStrategy.no_watermarks(),
+                "Kafka_Source"
+            )
+
+            logger.info("Starting combined processing pipeline...")
+
+            # Single combined processing step (replaces separate map operations)
+            processed_stream = data_stream.map(
+                CombinedProcessingMap(),
+                output_type=Types.STRING()
+            )
+
+            # Optional: Add logging for monitoring
+            processed_stream.print("Processed")
+
+            # Sink to output topic
+            logger.info("Setting up Kafka sink...")
+            processed_stream.sink_to(self.sink)
+
+            # Execute the job
+            job_name = job_name or "OptimizedRedditSentimentAnalysis"
+            logger.info(f"Starting optimized Flink job: {job_name}")
+            self.env.execute(job_name)
+
+        except Exception as e:
+            logger.error(f"Failed to execute Flink job: {e}")
+            raise
+
+def main():
+    """Main entry point for the optimized processor."""
+    try:
+        logger.info("Starting optimized Flink processor")
+        logger.info(f"Kafka endpoint: {KAFKA_ENDPOINT}")
+
+        # Create and run the optimized consumer
+        processor = FlinkKafkaConsumer()
+        processor.run()
+
+    except KeyboardInterrupt:
+        logger.info("Consumer stopped by user")
+    except Exception as e:
+        logger.error(f"Application failed: {e}")
+        raise
+
+if __name__ == '__main__':
+    main()
+
+==== ./data_ingestion\raw_comm_producer.py ====
+"""
+Reddit Comment Kafka Producer
+
+This module provides a Kafka producer for streaming Reddit comments
+from compressed archive files. It reads Zstandard-compressed JSON files containing
+Reddit comments and publishes them to a Kafka topic while maintaining temporal
+ordering and original timing between messages.
+
+Features:
+    - Zstandard decompression for efficient data reading
+    - Temporal batching to maintain comment timing relationships
+    - Validation and filtering of comments
+    - Error handling and metrics
+    - Configurable speed factor for replay acceleration/deceleration
+
+Dependencies:
+    - confluent-kafka: Kafka client library
+    - zstandard: Compression library for Reddit data files
+    - Custom configuration modules for data and Kafka settings
+
+Example:
+    Basic usage:
+        python raw_comm_producer.py --message_limit 1000 --speed_factor 2.0
+
+    Programmatic usage:
+        producer = RedditCommentProducer("localhost:9092", "comments", "data.zst")
+        producer.stream_raw_data(speed_factor=1.5, limit_messages=5000)
+
+Author: Veronika Anokhina
+Date: 01.06.2025
+Version: 1.0
+"""
+
+import io
+import json
+import time
+from datetime import datetime
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+import zstandard as zstd
+from confluent_kafka import Producer, KafkaException, Message
+
+#My own configurations
+from config.kafka_producer_config import *
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class RedditCommentProducer:
+    """
+    Kafka producer for streaming Reddit comments.
+
+    This class handles reading compressed Reddit comment data, validates and filters
+    comments based on configurable criteria, and streams them to Kafka while
+    maintaining temporal relationships between messages.
+
+    The producer implements batching based on comment timestamps to preserve
+    the original timing patterns in the data, which is crucial for realistic
+    streaming analytics scenarios.
+
+    Attributes:
+        producer (Producer):    Confluent Kafka producer instance
+        topic (str):            Target Kafka topic name
+        raw_data_path (str):    Path to the compressed Reddit data file
+        _metrics (dict):        Internal metrics tracking message processing
+
+    """
+
+    def __init__(self,
+                 bootstrap_server:str=KAFKA_BOOTSTRAP_SERVER,
+                 topic: str=RAW_COM_TOPIC,
+                 data_path: str = DATA_PATH,
+                 kafka_config=DEFAULT_KAFKA_CONFIG):
+        """
+        Initialize the Reddit Comment Producer.
+
+        Args:
+            bootstrap_servers (str): Kafka broker address
+            topic (str): Name of the Kafka topic to publish messages to
+            data_path (str): Path to the compressed Reddit comments file (.zst format)
+
+        Raises:
+            FileNotFoundError: If the data file doesn't exist
+            KafkaException: If Kafka producer initialization fails
+        """
+        # Validate data file exists
+        if not Path(data_path).exists():
+            raise FileNotFoundError(f"Reddit data file not found: {data_path}")
+
+        # Load default Kafka configuration and override bootstrap servers
+        conf = kafka_config.copy()
+        conf['bootstrap.servers'] = bootstrap_server
+
+        try:
+            self.producer = Producer(conf)
+            logger.info(f"Kafka producer initialized with servers: {bootstrap_server}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Kafka producer: {e}")
+            raise
+
+        self.topic = topic
+        self.raw_data_path = data_path
+
+        # Initialize metrics tracking
+        self._metrics = {
+            'messages_sent': 0,  # Successfully delivered messages
+            'invalid_json': 0,  # JSON parsing failures
+            'kafka_errors': 0,  # Kafka-specific errors
+            'delivery_errors': 0,  # Message delivery failures
+            'filtered_out': 0,  # Comments filtered by validation
+            'total_processed': 0  # Total comments processed
+        }
+
+        logger.info(f"Producer initialized for topic '{topic}' with data: {data_path}")
+
+    @staticmethod
+    def validate_comment(comment: Dict[str, Any]) -> bool:
+        """
+        Validate if a Reddit comment meets the filtering criteria.
+
+        This method performs comprehensive validation including:
+        - Required field presence check
+        - Timestamp range validation
+        - Content quality filtering (deleted/removed comments)
+        - Minimum body length requirement
+
+        Args:
+            comment (dict): Reddit comment dictionary with fields like 'body', 'created_utc', etc.
+
+        Returns:
+            bool: True if comment passes all validation criteria, False otherwise
+
+        Note:
+            Validation criteria are defined in config/data_config.py:
+            - FIELDS_TO_KEEP: Required fields that must be present
+            - MIN_TIMESTAMP, MAX_TIMESTAMP: Acceptable timestamp range
+            - MIN_BODY_LENGTH: Minimum comment body length
+        """
+        try:
+            # Check for required fields - drop fields that are not in fields to keep
+            if not all(field in comment for field in FIELDS_TO_KEEP):
+                return False
+
+            # Drop fields that are not in FIELDS_TO_KEEP (keep only specified fields)
+            keys_to_remove = [key for key in comment.keys() if key not in FIELDS_TO_KEEP]
+            for key in keys_to_remove:
+                del comment[key]
+
+            # Validate timestamp range (Unix timestamp)
+            created_utc = int(comment.get("created_utc", 0))
+            if not (MIN_TIMESTAMP <= created_utc <= MAX_TIMESTAMP):
+                return False
+
+            # Filter out deleted/removed comments
+            body = comment.get("body", "").strip().lower()
+            if body in ["[deleted]", "[removed]", ""]:
+                return False
+
+            # Enforce minimum body length to filter out low-quality comments
+            if len(comment.get("body", "").strip()) < MIN_BODY_LENGTH:
+                return False
+
+            return True
+
+        except (ValueError, TypeError, KeyError) as e:
+            # Log validation errors in debug mode
+            logger.error(f"Comment validation error: {e}")
+            return False
+
+    def _delivery_report(self, err: Optional[Exception], msg: Message) -> None:
+        """
+        Kafka delivery callback function.
+
+        This callback is invoked for each message produced to indicate the delivery
+        result. It updates internal metrics and provides debug information about
+        message delivery status.
+
+        Args:
+            err (Exception, optional): Delivery error if any, None on success
+            msg (Message): Kafka message object containing delivery metadata
+
+        Note:
+            This method is called asynchronously by the Kafka producer and should
+            be lightweight to avoid blocking the producer thread.
+        """
+        if err is not None:
+            self._metrics['delivery_errors'] += 1
+            logger.error(f'Message delivery failed: {err}')
+
+        else:
+            self._metrics['messages_sent'] += 1
+
+    def _log_stats(self, total_count: int, start_time: float, final: bool = False) -> None:
+        """
+        Log comprehensive processing statistics.
+
+        Provides both intermediate and final statistics about the streaming process,
+        including throughput metrics, error counts, and processing rates.
+
+        Args:
+            total_count (int): Total number of comments processed so far
+            start_time (float): Unix timestamp when processing started
+            final (bool): Whether this is the final statistics report
+
+        Note:
+            Statistics are logged in both structured format (for parsing) and
+            human-readable format (for monitoring).
+        """
+        elapsed = time.time() - start_time
+        rate = total_count / elapsed if elapsed > 0 else 0
+
+        # Calculate success rate
+        success_rate = (self._metrics['messages_sent'] / total_count * 100) if total_count > 0 else 0
+
+        stats = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'total_processed': total_count,
+            'processing_rate': f"{rate:.2f} msg/sec",
+            'messages_sent': self._metrics['messages_sent'],
+            'success_rate': f"{success_rate:.1f}%",
+            'invalid_json': self._metrics['invalid_json'],
+            'kafka_errors': self._metrics['kafka_errors'],
+            'delivery_errors': self._metrics['delivery_errors'],
+            'filtered_out': self._metrics['filtered_out'],
+            'elapsed_time': f"{elapsed:.2f}s"
+        }
+
+        # Log structured stats for automated monitoring
+        logger.info(f"Processing stats: {json.dumps(stats)}")
+
+        # Print human-readable stats
+        if final:
+            print("\n" + "=" * 50)
+            print("         FINAL PROCESSING STATISTICS")
+            print("=" * 50)
+        else:
+            print("\n" + "=" * 50)
+            print("      INTERMEDIATE PROCESSING STATISTICS")
+            print("=" * 50)
+
+        for key, value in stats.items():
+            print(f"{key.replace('_', ' ').title():>20}: {value}")
+
+        print("=" * 50)
+
+    def submit_batch(self, batch: List[Dict[str, Any]]) -> None:
+        """
+        Submit a batch of comments to Kafka.
+
+        This method handles the actual publishing of comment batches to Kafka,
+        including error handling for buffer overflow and network issues.
+
+        Args:
+            batch (list): List of validated comment dictionaries to publish
+
+        Note:
+            The method uses the original comment timestamp for message timestamping,
+            which enables event-time processing in downstream consumers.
+
+            Buffer overflow is handled by polling and retrying, ensuring reliable
+            delivery even under high throughput scenarios.
+        """
+        for batch_comment in batch:
+            try:
+                # Calculate message timestamp (Kafka expects milliseconds)
+                message_timestamp = int(batch_comment['created_utc'] * 1000)
+
+                # Serialize comment to JSON
+                message_value = json.dumps(batch_comment).encode('utf-8')
+
+                # Produce message with timestamp preservation
+                self.producer.produce(
+                    topic=self.topic,
+                    value=message_value,
+                    timestamp=message_timestamp,
+                    callback=self._delivery_report
+                )
+
+                # Non-blocking poll to trigger delivery callbacks
+                self.producer.poll(0)
+
+            except KafkaException as e:
+                self._metrics['kafka_errors'] += 1
+                logger.error(f"Kafka error while producing message: {e}")
+
+
+            except BufferError:
+                # Local producer queue is full - wait and retry
+                logger.warning("Producer buffer full, waiting for space...")
+                self.producer.poll(10)  # Wait up to 10 seconds
+
+                try:
+                    # Retry the message production
+                    self.producer.produce(
+                        topic=self.topic,
+                        value=json.dumps(batch_comment).encode('utf-8'),
+                        timestamp=int(batch_comment['created_utc'] * 1000),
+                        callback=self._delivery_report
+                    )
+                except Exception as retry_error:
+                    self._metrics['kafka_errors'] += 1
+                    logger.error(f"Failed to produce message after retry: {retry_error}")
+
+            except Exception as e:
+                self._metrics['kafka_errors'] += 1
+                logger.error(f"Unexpected error while producing message: {e}")
+
+    def stream_raw_data(self, speed_factor: float = 1.0, limit_messages: int = LIMIT_MESSAGES) -> None:
+        """
+        Stream Reddit comments from compressed file to Kafka.
+
+        This is the main processing method that:
+        1. Opens and decompresses the Reddit data file
+        2. Parses JSON comments line by line
+        3. Validates and filters comments
+        4. Groups comments by timestamp into batches
+        5. Maintains original timing between batches
+        6. Publishes batches to Kafka
+
+        Args:
+            speed_factor (float): Multiplier for replay speed.
+                                1.0 = original speed, 2.0 = 2x faster, 0.5 = 2x slower
+            limit_messages (int): Maximum number of messages to process (for testing)
+
+        Raises:
+            FileNotFoundError: If the data file cannot be found
+            zstd.ZstdError: If decompression fails
+            KafkaException: If Kafka operations fail
+
+        Note:
+            The method preserves temporal relationships between comments by grouping
+            them by timestamp and introducing appropriate delays between batches.
+            This is crucial for realistic streaming analytics scenarios.
+        """
+        start_time = time.time()
+        message_count = 0
+        input_path = Path(self.raw_data_path)
+
+        logger.info(f"Starting to stream data from: {input_path}")
+        logger.info(f"Speed factor: {speed_factor}x, Message limit: {limit_messages}")
+
+        try:
+            with open(input_path, "rb") as compressed_file:
+                logger.debug(f"Opening compressed file: {input_path}")
+
+                # Initialize Zstandard decompressor
+                #TODO BLOB
+                dctx = zstd.ZstdDecompressor()
+                stream_reader = dctx.stream_reader(compressed_file)
+                text_stream = io.TextIOWrapper(stream_reader, encoding='utf-8')
+
+                # Temporal batching variables
+                prev_timestamp = None
+                current_batch = []
+
+                logger.info("Starting line-by-line processing...")
+
+                for line_number, line in enumerate(text_stream, 1):
+                    # Check message limit for testing scenarios
+                    if message_count >= limit_messages:
+                        logger.info(f"Reached message limit of {limit_messages}")
+                        break
+
+                    # Parse JSON comment
+                    try:
+                        comment = json.loads(line.strip())
+                        self._metrics['total_processed'] += 1
+                    except json.JSONDecodeError as e:
+                        self._metrics['invalid_json'] += 1
+                        logger.debug(f"JSON decode error on line {line_number}: {e}")
+                        continue
+
+                    # Validate comment against filtering criteria
+                    if not self.validate_comment(comment):
+                        self._metrics['filtered_out'] += 1
+                        continue
+
+                    current_timestamp = comment.get('created_utc')
+
+                    # Process temporal batching
+                    if prev_timestamp is not None and current_timestamp != prev_timestamp:
+                        # Submit the completed batch
+                        if current_batch:
+                            self.submit_batch(current_batch)
+
+                        # Calculate and apply inter-batch delay to maintain timing
+                        time_diff = current_timestamp - prev_timestamp
+                        adjusted_delay = time_diff / speed_factor
+
+                        if adjusted_delay > 0:
+                            time.sleep(adjusted_delay)
+
+                        # Start new batch
+                        current_batch = []
+
+                    # Add comment to current batch
+                    current_batch.append(comment)
+                    prev_timestamp = current_timestamp
+                    message_count += 1
+
+                    # Periodic progress reporting
+                    if message_count % 1000 == 0:
+                        logger.info(f"Processed {message_count} messages...")
+
+                # Submit the final batch
+                if current_batch:
+                    logger.info(f"Submitting final batch of {len(current_batch)} messages")
+                    self.submit_batch(current_batch)
+
+                # Ensure all messages are delivered before finishing
+                logger.info("Flushing remaining messages...")
+                self.producer.flush(timeout=30)  # 30-second timeout
+
+                # Final statistics report
+                self._log_stats(message_count, start_time, final=True)
+                logger.info("Streaming completed successfully")
+
+        except FileNotFoundError:
+            logger.error(f"Data file not found: {input_path}")
+            raise
+        except zstd.ZstdError as e:
+            logger.error(f"Decompression error: {e}")
+            raise
+        except KeyboardInterrupt:
+            logger.info("Streaming interrupted by user")
+            self.producer.flush(timeout=10)
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during streaming: {e}")
+            raise
+
+    def get_metrics(self) -> Dict[str, int]:
+        """
+        Get current processing metrics.
+
+        Returns:
+            dict: Dictionary containing current metrics including message counts,
+                 error counts, and processing statistics
+        """
+        return self._metrics.copy()
+
+    def close(self) -> None:
+        """
+        Gracefully close the producer and flush any remaining messages.
+
+        This method should be called when shutting down to ensure all messages
+        are delivered before the application exits.
+        """
+        logger.info("Shutting down producer...")
+        self.producer.flush(timeout=30)
+        logger.info("Producer shutdown complete")
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments for the producer.
+
+    Returns:
+        argparse.Namespace: Parsed command-line arguments
+    """
+    parser = argparse.ArgumentParser(
+        description="Reddit Comment Kafka Producer - Stream Reddit comments to Kafka",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument(
+        "--message_limit",
+        type=int,
+        default=None,
+        help="Maximum number of messages to process (useful for testing)"
+    )
+
+    parser.add_argument(
+        "--speed_factor",
+        type=float,
+        default=None,
+        help="Speed multiplier for streaming (1.0=original speed, 2.0=2x faster, 0.5=2x slower)"
+    )
+
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=None,
+        help="Path to the compressed Reddit comments file"
+    )
+
+    parser.add_argument(
+        "--topic",
+        type=str,
+        default=None,
+        help="Kafka topic to publish messages to"
+    )
+
+    parser.add_argument(
+        "--bootstrap_servers",
+        type=str,
+        default=None,
+        help="Kafka bootstrap server"
+    )
+
+    parser.add_argument(
+        "--debug",
+        default=False,
+        help="Enable debug logging"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """
+    Main entry point for the Reddit Comment Producer application.
+
+    This function:
+    1. Parses command-line arguments
+    2. Configures logging based on debug flag
+    3. Initializes the producer with specified configuration
+    4. Starts the streaming process
+    5. Handles graceful shutdown
+    """
+    args = parse_arguments()
+
+    # Configure debug logging if requested
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logger.info("Starting Reddit Comment Producer")
+    logger.info(f"Configuration: {vars(args)}")
+
+    constructor_args = {}
+    if args.bootstrap_servers is not None:
+        constructor_args['bootstrap_server'] = args.bootstrap_servers
+    if args.topic is not None:
+        constructor_args['topic'] = args.topic
+    if args.data_path is not None:
+        constructor_args['data_path'] = args.data_path
+
+    producer = None
+    try:
+        # Initialize producer only with provided arguments
+        producer = RedditCommentProducer(**constructor_args)
+
+        # Prepare streaming arguments
+        stream_args = {}
+        if args.speed_factor is not None:
+            stream_args['speed_factor'] = args.speed_factor
+        if args.message_limit is not None:
+            stream_args['limit_messages'] = args.message_limit
+
+        # Start streaming data with provided arguments
+        producer.stream_raw_data(**stream_args)
+
+    except KeyboardInterrupt:
+        logger.info("Producer stopped by user")
+    except Exception as e:
+        logger.error(f"Producer failed: {e}")
+        raise
+    finally:
+        # Ensure graceful shutdown
+        if producer:
+            producer.close()
+
+
+# Usage Examples and Documentation
+"""
+USAGE EXAMPLES:
+   1. python raw_comm_producer.py --speed_factor 1.0 --message_limit 5000
+      python raw_comm_producer.py
+
+   2. Custom configuration:
+   python raw_comm_producer.py \
+     --bootstrap_server "localhost:29092" \
+     --topic "reddit-comments-test" \
+     --data_path "/path/to/RC_2023-01.zst" \
+     --message_limit 10000 \
+     --debug
+
+CONFIGURATION FILES:
+The producer depends on two configuration files:
+You can pass them eather as command line arguments or modify the default values in the code.
+
+1. config/kafka_producer_config.py:
+   - DATA_PATH: Path to compressed Reddit data file
+   - FIELDS_TO_KEEP: Required comment fields
+   - MIN_TIMESTAMP, MAX_TIMESTAMP: Timestamp filtering range
+   - MIN_BODY_LENGTH: Minimum comment body length
+   - ==============================================
+   - DEFAULT_KAFKA_CONFIG: Kafka producer configuration
+   - KAFKA_BOOTSTRAP_SERVER: Default Kafka servers
+   - RAW_COM_TOPIC: Default topic name
+   - LIMIT_MESSAGES: Default message limit
+"""
+
+if __name__ == "__main__":
+    main()
+
+
+==== ./data_ingestion\__init__.py ====
+
+
+==== ./data_ingestion\config\kafka_producer_config.py ====
+DEFAULT_KAFKA_CONFIG = {
+    'compression.type': 'gzip',
+    'message.timeout.ms': 5000,
+    'queue.buffering.max.messages': 100000,
+    'queue.buffering.max.ms': 1000,
+    'batch.num.messages': 1000,
+    'default.topic.config': {
+        'acks': 'all'
+    }
+}
+
+KAFKA_BOOTSTRAP_SERVER = "kafka:9092"  # Docker service name
+# for local testing, you can change it to "localhost:29092"
+
+RAW_COM_TOPIC = "raw-reddit-comments"
+LIMIT_MESSAGES = 20
+
+DATA_PATH = "/data/RC_2019-04.zst"  # Will be mounted from host
+
+FIELDS_TO_KEEP = [
+    "id",
+    "author",
+    "created_utc",
+    "body",
+    "score",
+    "subreddit",
+    "controversiality"
+]
+
+MIN_TIMESTAMP = 1554076800
+MAX_TIMESTAMP = 1555472130
+MIN_BODY_LENGTH = 10
+
+==== ./data_ingestion\config\slang.py ====
+"""up-to-date list of slangs and abbreviations used in today modern tweets and chat texts from 2020
+source: https://www.kaggle.com/code/nmaguette/up-to-date-list-of-slangs-for-text-preprocessing """
+
+class Slang:
+    abbreviations = {
+        "$" : " dollar ",
+        "€" : " euro ",
+        "4ao" : "for adults only",
+        "a.m" : "before midday",
+        "a3" : "anytime anywhere anyplace",
+        "aamof" : "as a matter of fact",
+        "acct" : "account",
+        "adih" : "another day in hell",
+        "afaic" : "as far as i am concerned",
+        "afaict" : "as far as i can tell",
+        "afaik" : "as far as i know",
+        "afair" : "as far as i remember",
+        "afk" : "away from keyboard",
+        "app" : "application",
+        "approx" : "approximately",
+        "apps" : "applications",
+        "asap" : "as soon as possible",
+        "asl" : "age, sex, location",
+        "atk" : "at the keyboard",
+        "ave." : "avenue",
+        "aymm" : "are you my mother",
+        "ayor" : "at your own risk",
+        "b&b" : "bed and breakfast",
+        "b+b" : "bed and breakfast",
+        "b.c" : "before christ",
+        "b2b" : "business to business",
+        "b2c" : "business to customer",
+        "b4" : "before",
+        "b4n" : "bye for now",
+        "b@u" : "back at you",
+        "bae" : "before anyone else",
+        "bak" : "back at keyboard",
+        "bbbg" : "bye bye be good",
+        "bbc" : "british broadcasting corporation",
+        "bbias" : "be back in a second",
+        "bbl" : "be back later",
+        "bbs" : "be back soon",
+        "be4" : "before",
+        "bfn" : "bye for now",
+        "blvd" : "boulevard",
+        "bout" : "about",
+        "brb" : "be right back",
+        "bros" : "brothers",
+        "brt" : "be right there",
+        "bsaaw" : "big smile and a wink",
+        "btw" : "by the way",
+        "bwl" : "bursting with laughter",
+        "c/o" : "care of",
+        "cet" : "central european time",
+        "cf" : "compare",
+        "cia" : "central intelligence agency",
+        "csl" : "can not stop laughing",
+        "cu" : "see you",
+        "cul8r" : "see you later",
+        "cv" : "curriculum vitae",
+        "cwot" : "complete waste of time",
+        "cya" : "see you",
+        "cyt" : "see you tomorrow",
+        "dae" : "does anyone else",
+        "dbmib" : "do not bother me i am busy",
+        "diy" : "do it yourself",
+        "dm" : "direct message",
+        "dwh" : "during work hours",
+        "e123" : "easy as one two three",
+        "eet" : "eastern european time",
+        "eg" : "example",
+        "embm" : "early morning business meeting",
+        "encl" : "enclosed",
+        "encl." : "enclosed",
+        "etc" : "and so on",
+        "faq" : "frequently asked questions",
+        "fawc" : "for anyone who cares",
+        "fb" : "facebook",
+        "fc" : "fingers crossed",
+        "fig" : "figure",
+        "fimh" : "forever in my heart",
+        "ft." : "feet",
+        "ft" : "featuring",
+        "ftl" : "for the loss",
+        "ftw" : "for the win",
+        "fwiw" : "for what it is worth",
+        "fyi" : "for your information",
+        "g9" : "genius",
+        "gahoy" : "get a hold of yourself",
+        "gal" : "get a life",
+        "gcse" : "general certificate of secondary education",
+        "gfn" : "gone for now",
+        "gg" : "good game",
+        "gl" : "good luck",
+        "glhf" : "good luck have fun",
+        "gmt" : "greenwich mean time",
+        "gmta" : "great minds think alike",
+        "gn" : "good night",
+        "g.o.a.t" : "greatest of all time",
+        "goat" : "greatest of all time",
+        "goi" : "get over it",
+        "gps" : "global positioning system",
+        "gr8" : "great",
+        "gratz" : "congratulations",
+        "gyal" : "girl",
+        "h&c" : "hot and cold",
+        "hp" : "horsepower",
+        "hr" : "hour",
+        "hrh" : "his royal highness",
+        "ht" : "height",
+        "ibrb" : "i will be right back",
+        "ic" : "i see",
+        "icq" : "i seek you",
+        "icymi" : "in case you missed it",
+        "idc" : "i do not care",
+        "idgadf" : "i do not give a damn fuck",
+        "idgaf" : "i do not give a fuck",
+        "idk" : "i do not know",
+        "ie" : "that is",
+        "i.e" : "that is",
+        "ifyp" : "i feel your pain",
+        "IG" : "instagram",
+        "iirc" : "if i remember correctly",
+        "ilu" : "i love you",
+        "ily" : "i love you",
+        "imho" : "in my humble opinion",
+        "imo" : "in my opinion",
+        "imu" : "i miss you",
+        "iow" : "in other words",
+        "irl" : "in real life",
+        "j4f" : "just for fun",
+        "jic" : "just in case",
+        "jk" : "just kidding",
+        "jsyk" : "just so you know",
+        "l8r" : "later",
+        "lb" : "pound",
+        "lbs" : "pounds",
+        "ldr" : "long distance relationship",
+        "lmao" : "laugh my ass off",
+        "lmfao" : "laugh my fucking ass off",
+        "lol" : "laughing out loud",
+        "ltd" : "limited",
+        "ltns" : "long time no see",
+        "m8" : "mate",
+        "mf" : "motherfucker",
+        "mfs" : "motherfuckers",
+        "mfw" : "my face when",
+        "mofo" : "motherfucker",
+        "mph" : "miles per hour",
+        "mr" : "mister",
+        "mrw" : "my reaction when",
+        "ms" : "miss",
+        "mte" : "my thoughts exactly",
+        "nagi" : "not a good idea",
+        "nbc" : "national broadcasting company",
+        "nbd" : "not big deal",
+        "nfs" : "not for sale",
+        "ngl" : "not going to lie",
+        "nhs" : "national health service",
+        "nrn" : "no reply necessary",
+        "nsfl" : "not safe for life",
+        "nsfw" : "not safe for work",
+        "nth" : "nice to have",
+        "nvr" : "never",
+        "nyc" : "new york city",
+        "oc" : "original content",
+        "og" : "original",
+        "ohp" : "overhead projector",
+        "oic" : "oh i see",
+        "omdb" : "over my dead body",
+        "omg" : "oh my god",
+        "omw" : "on my way",
+        "p.a" : "per annum",
+        "p.m" : "after midday",
+        "pm" : "prime minister",
+        "poc" : "people of color",
+        "pov" : "point of view",
+        "pp" : "pages",
+        "ppl" : "people",
+        "prw" : "parents are watching",
+        "ps" : "postscript",
+        "pt" : "point",
+        "ptb" : "please text back",
+        "pto" : "please turn over",
+        "qpsa" : "what happens", #"que pasa",
+        "ratchet" : "rude",
+        "rbtl" : "read between the lines",
+        "rlrt" : "real life retweet",
+        "rofl" : "rolling on the floor laughing",
+        "roflol" : "rolling on the floor laughing out loud",
+        "rotflmao" : "rolling on the floor laughing my ass off",
+        "rt" : "retweet",
+        "ruok" : "are you ok",
+        "sfw" : "safe for work",
+        "sk8" : "skate",
+        "smh" : "shake my head",
+        "sq" : "square",
+        "srsly" : "seriously",
+        "ssdd" : "same stuff different day",
+        "tbh" : "to be honest",
+        "tbs" : "tablespooful",
+        "tbsp" : "tablespooful",
+        "tfw" : "that feeling when",
+        "thks" : "thank you",
+        "tho" : "though",
+        "thx" : "thank you",
+        "tia" : "thanks in advance",
+        "til" : "today i learned",
+        "tl;dr" : "too long i did not read",
+        "tldr" : "too long i did not read",
+        "tmb" : "tweet me back",
+        "tntl" : "trying not to laugh",
+        "ttyl" : "talk to you later",
+        "u" : "you",
+        "u2" : "you too",
+        "u4e" : "yours for ever",
+        "utc" : "coordinated universal time",
+        "w/" : "with",
+        "w/o" : "without",
+        "w8" : "wait",
+        "wassup" : "what is up",
+        "wb" : "welcome back",
+        "wtf" : "what the fuck",
+        "wtg" : "way to go",
+        "wtpa" : "where the party at",
+        "wuf" : "where are you from",
+        "wuzup" : "what is up",
+        "wywh" : "wish you were here",
+        "yd" : "yard",
+        "ygtr" : "you got that right",
+        "ynk" : "you never know",
+        "zzz" : "sleeping bored and tired"
+    }
+
+
+==== ./data_ingestion\config\__init__.py ====
+
+
+==== ./data_ingestion\test_script\key_word_test.py ====
+"""
+Test Script for Keyword Aggregation System
+
+This script helps test the keyword aggregation functionality by:
+1. Sending test keyword requests to the keyword_requests topic
+2. Monitoring responses from keyword_responses topic
+3. Verifying the complete pipeline works end-to-end
+
+Usage:
+    python test_keyword_system.py --test-request
+    python test_keyword_system.py --monitor-responses
+    python test_keyword_system.py --full-test
+"""
+
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+from confluent_kafka import Producer, Consumer, KafkaException
+import argparse
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Kafka configuration
+KAFKA_BOOTSTRAP_SERVERS = "localhost:29092"  # Use external port when running from host
+KEYWORD_REQUESTS_TOPIC = "keyword_requests"
+KEYWORD_RESPONSES_TOPIC = "keyword_responses"
+
+
+def create_producer():
+    """Create Kafka producer"""
+    config = {
+        'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+        'client.id': 'keyword_test_producer'
+    }
+    return Producer(config)
+
+
+def create_consumer(topic):
+    """Create Kafka consumer"""
+    config = {
+        'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+        'group.id': f'keyword_test_consumer_{int(time.time())}',
+        'auto.offset.reset': 'latest',
+        'enable.auto.commit': True
+    }
+    consumer = Consumer(config)
+    consumer.subscribe([topic])
+    return consumer
+
+
+def send_test_request(producer, user_id=None, keyword1="trump", keyword2="biden"):
+    """Send a test keyword request"""
+    if not user_id:
+        user_id = str(uuid.uuid4())
+
+    request = {
+        'user_id': user_id,
+        'keyword1': keyword1,
+        'keyword2': keyword2,
+        'request_time': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    }
+
+    try:
+        producer.produce(
+            topic=KEYWORD_REQUESTS_TOPIC,
+            value=json.dumps(request).encode('utf-8'),
+            callback=lambda err, msg: logger.info(f"Request sent: {msg.value()}" if not err else f"Error: {err}")
+        )
+        producer.flush()
+        logger.info(f"Sent keyword request: {request}")
+        return user_id
+    except Exception as e:
+        logger.error(f"Failed to send request: {e}")
+        return None
+
+
+def monitor_responses(duration_seconds=60):
+    """Monitor keyword responses"""
+    consumer = create_consumer(KEYWORD_RESPONSES_TOPIC)
+    logger.info(f"Monitoring responses for {duration_seconds} seconds...")
+
+    start_time = time.time()
+    try:
+        while time.time() - start_time < duration_seconds:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                logger.error(f"Consumer error: {msg.error()}")
+                continue
+
+            try:
+                response = json.loads(msg.value().decode('utf-8'))
+                logger.info(f"Received response: {json.dumps(response, indent=2)}")
+                print(f"\n=== KEYWORD RESPONSE ===")
+                print(f"User ID: {response.get('user_id')}")
+                print(f"Keyword1 '{response.get('keyword1')}': {response.get('value1', 0):.2%} positive")
+                print(f"Keyword2 '{response.get('keyword2')}': {response.get('value2', 0):.2%} positive")
+                print(f"Timestamp: {response.get('timestamp')}")
+                print("========================\n")
+            except Exception as e:
+                logger.error(f"Failed to parse response: {e}")
+
+    except KeyboardInterrupt:
+        logger.info("Monitoring stopped by user")
+    finally:
+        consumer.close()
+
+
+def run_full_test():
+    """Run complete end-to-end test"""
+    logger.info("Starting full keyword aggregation test...")
+
+    # Step 1: Send test request
+    producer = create_producer()
+    user_id = send_test_request(producer, keyword1="trump", keyword2="election")
+
+    if not user_id:
+        logger.error("Failed to send test request")
+        return
+
+    logger.info(f"Test request sent for user {user_id}")
+    logger.info("Now monitoring for responses...")
+
+    # Step 2: Monitor for responses
+    monitor_responses(120)  # Monitor for 2 minutes
+
+
+def test_multiple_requests():
+    """Send multiple test requests with different keywords"""
+    producer = create_producer()
+
+    test_cases = [
+        ("trump", "biden"),
+        ("covid", "vaccine"),
+        ("crypto", "bitcoin"),
+        ("climate", "environment"),
+        ("sports", "football")
+    ]
+
+    user_ids = []
+    for keyword1, keyword2 in test_cases:
+        user_id = send_test_request(producer, keyword1=keyword1, keyword2=keyword2)
+        if user_id:
+            user_ids.append(user_id)
+            time.sleep(2)  # Space out requests
+
+    logger.info(f"Sent {len(user_ids)} test requests")
+    return user_ids
+
+
+def check_kafka_topics():
+    """Check if required Kafka topics exist"""
+    from confluent_kafka.admin import AdminClient
+
+    admin_client = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+
+    try:
+        metadata = admin_client.list_topics(timeout=10)
+        topics = set(metadata.topics.keys())
+
+        required_topics = {KEYWORD_REQUESTS_TOPIC, KEYWORD_RESPONSES_TOPIC, "labeled-reddit-comments"}
+        missing_topics = required_topics - topics
+
+        if missing_topics:
+            logger.warning(f"Missing topics: {missing_topics}")
+            return False
+        else:
+            logger.info("All required topics exist")
+            return True
+
+    except Exception as e:
+        logger.error(f"Failed to check topics: {e}")
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test Keyword Aggregation System")
+    parser.add_argument("--test-request", action="store_true", help="Send a single test request")
+    parser.add_argument("--monitor-responses", action="store_true", help="Monitor keyword responses")
+    parser.add_argument("--full-test", action="store_true", help="Run complete end-to-end test")
+    parser.add_argument("--multiple-requests", action="store_true", help="Send multiple test requests")
+    parser.add_argument("--check-topics", action="store_true", help="Check if Kafka topics exist")
+    parser.add_argument("--keyword1", default="trump", help="First keyword for test")
+    parser.add_argument("--keyword2", default="biden", help="Second keyword for test")
+    parser.add_argument("--duration", type=int, default=60, help="Monitoring duration in seconds")
+
+    #{"id": "ejualnj",
+    # "created_utc": 1554076800,
+    # "subreddit": "IndoorGarden",
+    # "score": 3,
+    # "cleaned_body": "how do you avoid getting fungus gnats in her soil my maidenhair fern seems to be prone to them because she likes water facewithrollingeyes",
+    # "label": "negative",
+    # "original_length": 121}
+
+    #{"id": "ejualnk",
+    # "created_utc": 1554076800,
+    # "subreddit": "doordash",
+    # "score": 7, "cleaned_body":
+    # "we still get paid in full dont worry",
+    # "label": "positive",
+    # "original_length": 37}
+
+    args = parser.parse_args()
+
+    if args.check_topics:
+        check_kafka_topics()
+    elif args.test_request:
+        producer = create_producer()
+        user_id = send_test_request(producer, keyword1=args.keyword1, keyword2=args.keyword2)
+        if user_id:
+            print(f"Test request sent for user: {user_id}")
+    elif args.monitor_responses:
+        monitor_responses(args.duration)
+    elif args.multiple_requests:
+        test_multiple_requests()
+    elif args.full_test:
+        run_full_test()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+==== ./data_proccesing\data.py ====
+"""
+Reddit Comment Filter Script
+
+This script decompresses a Reddit comment dump (.zst),
+filters comments based on timestamp, content, and field presence,
+and saves the result as a JSON Lines (.jsonl) file.
+
+Requirements:
+- pip install zstandard
+
+Usage:
+- Set INPUT_FILE and OUTPUT_FILE paths.
+- Run: python data.py
+
+[Created: 10.5.2025 by Sara Vesela]
+"""
+import json
+import zstandard as zstd  # pip install zstandard
+from pathlib import Path
+import io
+
+# === CONFIGURATION ===
+INPUT_FILE = "/home/sarah/Documents/RC_2019-04.zst"     # Input .zst file (compressed)
+OUTPUT_FILE = "filtered_comments.jsonl"                 # Output file (.jsonl)
+MIN_TIMESTAMP = 1554076800                              # Start of date range (UTC)
+MAX_TIMESTAMP = 1555472130                              # End of date range (UTC)
+MIN_BODY_LENGTH = 5                                     # Minimum comment length
+
+# === KEYS TO KEEP ===
+FIELDS_TO_KEEP = ["id", "author", "created_utc", "body", "score", "subreddit", "controversiality"]
+
+# === FUNCTION ===
+"""Check if the comment meets filtering criteria."""
+def is_valid(comment):
+    try:
+        if not all(field in comment for field in FIELDS_TO_KEEP):
+            return False
+        if not (MIN_TIMESTAMP <= int(comment["created_utc"]) <= MAX_TIMESTAMP):
+            return False
+        if comment["body"].strip().lower() in ["[deleted]", "[removed]"]:
+            return False
+        if len(comment["body"].strip()) < MIN_BODY_LENGTH:
+            return False
+        return True
+    except Exception:
+        return False
+
+# === MAIN ===
+def main():
+    input_path = Path(INPUT_FILE)
+    output_path = Path(OUTPUT_FILE)
+
+    count_total = 0
+    count_kept = 0
+
+    with open(output_path, "w", encoding="utf-8") as out_file:
+        with open(input_path, "rb") as compressed:
+            dctx = zstd.ZstdDecompressor()
+            stream_reader = dctx.stream_reader(compressed)
+            text_stream = io.TextIOWrapper(stream_reader, encoding='utf-8')
+
+            for line in text_stream:
+                try:
+                    #decoded = line.decode("utf-8")
+                    comment = json.loads(line)
+                    count_total += 1
+
+                    if is_valid(comment):
+                        filtered = {k: comment[k] for k in FIELDS_TO_KEEP}
+                        out_file.write(json.dumps(filtered, ensure_ascii=False) + "\n")
+                        count_kept += 1
+
+                except Exception:
+                    continue  # skip broken lines
+
+                # Optional: show progress
+                if count_total % 100000 == 0:
+                    print(f"Processed: {count_total:,}, Kept: {count_kept:,}")
+
+    print(f"\nDone! Total: {count_total:,}, Filtered: {count_kept:,} saved to: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
+
+
+==== ./data_proccesing\labeling.py ====
+"""
+Reddit Comment Sentiment Labeling and Correlation Analysis
+
+This script performs three main functions:
+
+1. **Sentiment Labeling (main)**:
+   - Reads a JSONL file with Reddit comments (`filtered_comments.jsonl`)
+   - Uses VADER sentiment analysis to label each comment as positive, neutral, or negative
+   - Saves labeled comments into `labeled_comments.csv`
+   - Uses multiprocessing for parallel processing
+
+2. **Threshold Testing (testing)**:
+   - Explores how different VADER compound score thresholds affect sentiment label distribution
+
+3. **Correlation Analysis**:
+   - `compute_correlation()`: Correlation of sentiment label with `score` and `controversiality`
+   - `compute_subreddit_correlation()`: Same as above but grouped by subreddit
+
+Dependencies:
+- vaderSentiment
+- tqdm
+- pandas
+- multiprocessing
+- csv
+- json
+
+Run Options:
+- Uncomment the desired function in the `if __name__ == "__main__"` block.
+[Created: 12.5.2025 by Sara Vesela]
+"""
+import json
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from tqdm import tqdm
+import csv
+from multiprocessing import Pool, cpu_count
+import pandas as pd
+import random
+
+# === CONFIGURATION ===
+INPUT_FILE = "filtered_comments.jsonl"
+OUTPUT_FILE = "labeled_comments.csv"
+MAX_ROWS = 100_000       # For testing or threshold analysis
+BATCH_SIZE = 100_000     # Chunk size for multiprocessing
+
+# Sentiment thresholds for analysis
+THRESHOLDS = [0.05, 0.1, 0.2, 0.3]
+
+# === SETUP ===
+analyzer = SentimentIntensityAnalyzer()
+output = []
+
+def testing():
+    """Analyze how label distribution varies with different sentiment thresholds."""
+    results = {t: {"pos": 0, "neg": 0, "neu": 0} for t in THRESHOLDS}
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        for i, line in enumerate(tqdm(f, desc="Analyzing comments")):
+            if i >= MAX_ROWS:
+                break
+            try:
+                comment = json.loads(line)
+                text = comment["body"]
+                score = analyzer.polarity_scores(text)["compound"]
+
+                for t in THRESHOLDS:
+                    if score >= t:
+                        results[t]["pos"] += 1
+                    elif score <= -t:
+                        results[t]["neg"] += 1
+                    else:
+                        results[t]["neu"] += 1
+
+            except Exception:
+                continue
+    print(f"\nSentiment distribution for {MAX_ROWS:,} comments:\n")
+    for t in THRESHOLDS:
+        total = sum(results[t].values())
+        print(f"Threshold ±{t:.2f}")
+        print(f"  Positive: {results[t]['pos']:,} ({results[t]['pos'] / total:.1%})")
+        print(f"  Negative: {results[t]['neg']:,} ({results[t]['neg'] / total:.1%})")
+        print(f"  Neutral : {results[t]['neu']:,} ({results[t]['neu'] / total:.1%})\n")
+
+def compute_correlation():
+    """Compute correlation between sentiment label and score/controversiality."""
+    # Load first 1 million rows
+    #df = pd.read_csv("labeled_comments.csv", nrows=1_000_000)
+    # Load 1 milion random rows
+    df = pd.read_csv("labeled_comments.csv", skiprows=lambda i: i > 0 and random.random() > 1_000_000/63_000_000, nrows=1_000_000)
+
+    # Map labels to numeric values for correlation
+    df["label_numeric"] = df["label"].map({
+        "negative": -1,
+        "neutral": 0,
+        "positive": 1
+    })
+
+    # Compute correlation
+    correlation = df[["label_numeric", "score", "controversiality"]].corr()
+    print(correlation)
+
+# Group by subreddit and compute correlation with label
+def correlation_with_label(group):
+    """Helper function: computes correlation matrix for a subreddit group."""
+    corr = group[["label_numeric", "score", "controversiality"]].corr()
+    return corr.loc["label_numeric", ["score", "controversiality"]]
+
+def compute_subreddit_correlation():
+    """Group data by subreddit and analyze label correlation with score/controversiality."""
+    # Load a 1M-row sample for performance (you can load more if RAM allows)
+    #df = pd.read_csv("labeled_comments.csv", nrows=10_000_000)
+    df = pd.read_csv("labeled_comments.csv", skiprows=lambda i: i > 0 and random.random() > 10_000_000/63_000_000, nrows=1_000_000)
+
+    # Map label to numeric
+    df["label_numeric"] = df["label"].map({
+        "negative": -1,
+        "neutral": 0,
+        "positive": 1
+    })
+    # Drop rows with missing subreddit or label_numeric
+    df = df.dropna(subset=["subreddit", "label_numeric"])
+    df["controversiality"] = pd.to_numeric(df["controversiality"], errors='coerce')
+    # Add comment counts per subreddit
+    subreddit_counts = df["subreddit"].value_counts()
+
+    # Keep only subreddits with at least 100 comments
+    valid_subreddits = subreddit_counts[subreddit_counts >= 100].index
+    df_filtered = df[df["subreddit"].isin(valid_subreddits)]
+    # Apply the function to each group
+    subreddit_correlations = df_filtered.groupby("subreddit", group_keys=False).apply(correlation_with_label)
+
+    # Rename for clarity
+    subreddit_correlations.columns = ["label_vs_score", "label_vs_controversiality"]
+
+    # Sort by correlation with score
+    print("\nTop 10 subreddits where sentiment label correlates with score:\n")
+    print(subreddit_correlations.sort_values("label_vs_score", ascending=False).head(10))
+
+    print("\nTop 10 subreddits where sentiment label correlates negatively with score:\n")
+    print(subreddit_correlations.sort_values("label_vs_score").head(10))
+
+def label_comment(comment):
+    """Label a comment using VADER sentiment analysis."""
+    text = comment.get("body", "")
+    if not text:
+        return None
+
+    score = analyzer.polarity_scores(text)["compound"]
+    if score >= 0.1:
+        label = "positive"
+    elif score <= -0.1:
+        label = "negative"
+    else:
+        label = "neutral"
+
+    return {
+        "id": comment.get("id"),
+        "created_utc": comment.get("created_utc"),
+        "subreddit": comment.get("subreddit"),
+        "body": text,
+        "label": label,
+        "score": comment.get("score", 0),
+        "controversiality": comment.get("controversiality", 0)
+    }
+
+def process_batch(lines):
+    """Label all comments in a batch of lines."""
+    batch = []
+    for line in lines:
+        try:
+            comment = json.loads(line)
+            labeled = label_comment(comment)
+            if labeled:
+                batch.append(labeled)
+        except Exception:
+            continue
+    return batch
+
+def chunkify(iterator, size):
+    """Yield successive chunks from an iterator"""
+    chunk = []
+    for line in iterator:
+        chunk.append(line)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+def main():
+    """Main function for labeling all comments and writing them to a CSV."""
+    with open(INPUT_FILE, "r", encoding="utf-8") as infile, \
+         open(OUTPUT_FILE, "w", encoding="utf-8", newline='') as out_csv:
+
+        writer = csv.DictWriter(out_csv, fieldnames=["id", "created_utc", "subreddit", "body", "label", "score", "controversiality"])
+        writer.writeheader()
+        pool = Pool(cpu_count())  # Use all available CPU cores
+        total_labeled = 0
+        # tqdm over chunkified input
+        for result in tqdm(pool.imap(process_batch, chunkify(infile, BATCH_SIZE)), desc="Labeling in parallel"):
+            if result:
+                writer.writerows(result)
+                total_labeled += len(result)
+                print(f"Saved {total_labeled:,} labeled comments")
+
+        pool.close()
+        pool.join()
+
+    print(f"\nDone! Total labeled comments saved to: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    # Uncomment the function you want to run:
+    # testing()                      # Analyze threshold distributions
+    # main()                         # Perform full labeling
+    # compute_correlation()         # Global correlation analysis
+    compute_subreddit_correlation()  # Correlation grouped by subreddit
+
+==== ./data_proccesing\preprocessing.py ====
+"""
+Reddit Comment Preprocessing and TF-IDF Feature Extraction
+This script performs large-scale preprocessing of Reddit comments
+and transforms them into TF-IDF feature vectors suitable for machine learning.
+
+The pipeline consists of three main stages:
+
+1. **Text Cleaning**:
+   - Loads raw Reddit comments from `labeled_comments.csv`
+   - Applies preprocessing: lowercasing, emoji conversion, slang expansion,
+     removal of usernames, subreddits, URLs, punctuation, and tokenization
+   - Saves cleaned comments into a plain text file (`cleaned_lines.txt`)
+   - Also stores associated metadata into chunked CSV files (`meta_chunks/`)
+
+2. **TF-IDF Vectorization**:
+   - Loads cleaned text
+   - Fits a `TfidfVectorizer` with unigrams and bigrams, filters rare terms
+   - Transforms all cleaned comments into a sparse TF-IDF matrix
+
+3. **Saving TF-IDF Matrix**:
+   - Saves the full TF-IDF matrix into chunked `.npz` files
+   - Each chunk corresponds to `CHUNK_SIZE` rows and is stored in `tfidf_chunks/`
+
+Requirements:
+- emoji
+- pandas
+- nltk
+- scikit-learn
+- scipy
+- A custom `slang.py` file providing a `Slang.abbreviations` dictionary
+
+Run Instructions:
+- Place your raw comment file as `labeled_comments.csv` in the same directory
+- Ensure `slang.py` exists and includes a slang mapping dictionary
+- Run: `python this_script.py`
+[Created: 15.5.2025 by Sara Vesela]
+"""
+import emoji
+import pandas as pd
+import re
+import nltk
+import joblib
+import numpy as np
+import time
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from slang import Slang
+from sklearn.feature_extraction.text import TfidfVectorizer
+import os
+from scipy.sparse import save_npz
+
+nltk.download('punkt_tab')
+nltk.download('stopwords')
+
+# === CONFIGURATION ===
+INPUT_FILE = "labeled_comments.csv"       # Input CSV containing raw Reddit comments
+TEXT_FILE = "cleaned_lines.txt"           # Output file for cleaned text lines
+OUT_DIR = "tfidf_chunks_2"                  # Directory to store TF-IDF chunks
+META_DIR = "meta_chunks"                  # Directory to store metadata chunks
+CHUNK_SIZE = 1_000_000                    # Number of rows per chunk for processing
+KEEP_PUNCTUATION = False                 # Reserved for future use
+
+# Create output directories if they don't exist
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(META_DIR, exist_ok=True)
+
+# === Expand abbreviations ===
+def expand_slang(text):
+    """
+        Replaces slang/abbreviations using the Slang.abbreviations dictionary.
+        Args:
+            text (str): Input text to process.
+        Returns:
+            str: Text with slang terms expanded.
+        """
+    words = text.split()
+    expanded = [Slang.abbreviations.get(word.lower(), word) for word in words]
+    return " ".join(expanded)
+
+def clean_text(text):
+    """
+        Cleans the given comment text by:
+        - Lowercasing
+        - Removing emojis
+        - Expanding slang
+        - Removing usernames, subreddits, URLs, punctuation
+        - Tokenizing into words
+        Args:
+            text (str): Raw Reddit comment.
+        Returns:
+            str: Cleaned text string.
+        """
+    try:
+        text = str(text).lower()
+        text = emoji.demojize(text, delimiters=(" ", " "))
+        text = expand_slang(text)
+        text = re.sub(r"/?u/\w+", "", text)
+        text = re.sub(r"/?r/\w+", "", text)
+        text = re.sub(r"http\S+|www.\S+", "", text)
+        text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        tokens = word_tokenize(text)
+        return " ".join(tokens)
+    except Exception:
+        return ""
+
+
+def clean():
+    with open(TEXT_FILE, "w", encoding="utf-8") as text_out:
+        for i, chunk in enumerate(pd.read_csv(INPUT_FILE, chunksize=CHUNK_SIZE)):
+            print(f"Cleaning chunk {i + 1}")
+
+            # Preprocess body
+            chunk["cleaned_body"] = chunk["body"].astype(str).apply(clean_text)
+
+            # Write cleaned text to file
+            text_out.write("\n".join(chunk["cleaned_body"]) + "\n")
+
+            # Write metadata (excluding raw body and cleaned text)
+            meta = chunk[["id", "created_utc", "subreddit", "score", "controversiality", "label"]].copy()
+            meta.to_csv(f"{META_DIR}/meta_chunk_{i + 1}.csv", index=False)
+
+    print("\nDone saving cleaned text and metadata chunks.")
+
+def vectorize():
+    # === Fit TF-IDF on all text ===
+    print("Fitting TF-IDF on full dataset...")
+    with open(TEXT_FILE, encoding="utf-8") as f:
+        all_lines = f.readlines()
+
+    # Initialize TF-IDF vectorizer
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),          # Unigrams + bigrams
+        min_df=5,                    # Ignore terms in < 5 docs
+        max_features=50_000          # Limit vocab size
+    )
+    X_all = vectorizer.fit_transform(all_lines)
+    print(f"TF-IDF matrix shape: {X_all.shape}")
+
+    # Save the vectorizer
+    joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
+    print("Saved vectorizer to tfidf_vectorizer.pkl")
+    # === Save in chunks ===
+    n_chunks = (X_all.shape[0] + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    for i in range(n_chunks):
+        start = i * CHUNK_SIZE
+        end = min((i + 1) * CHUNK_SIZE, X_all.shape[0])
+        save_npz(f"{OUT_DIR}/X_chunk_{i+1}.npz", X_all[start:end])
+        print(f"Saved chunk {i+1} [{start}:{end}]")
+
+    print("\nDone! All TF-IDF chunks saved.")
+
+def fit_vectorizer(sample_size=1_000_000):
+    print(f"Fitting vectorizer on first {sample_size} lines...")
+    lines = []
+    with open(TEXT_FILE, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i >= sample_size:
+                break
+            lines.append(line.strip())
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=10, max_features=25000, sublinear_tf=True)
+    vectorizer.fit(lines)
+    joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
+    print(f"Vectorizer fitted and saved to tfidf_vectorizer.pkl")
+
+
+def transform_in_chunks(chunk_size=1_000_000):
+    vectorizer = joblib.load("tfidf_vectorizer.pkl")
+    os.makedirs("tfidf_chunks_", exist_ok=True)
+
+    with open(TEXT_FILE, encoding="utf-8") as f:
+        chunk = []
+        chunk_id = 1
+        for i, line in enumerate(f, 1):
+            chunk.append(line.strip())
+            if i % chunk_size == 0:
+                print(f"Vectorizing chunk {chunk_id} ({len(chunk)} lines)")
+                X = vectorizer.transform(chunk)
+                save_npz(f"tfidf_chunks_2/X_chunk_{chunk_id}.npz", X)
+                chunk = []
+                chunk_id += 1
+
+        # Final leftover chunk
+        if chunk:
+            print(f"Vectorizing final chunk {chunk_id} ({len(chunk)} lines)")
+            X = vectorizer.transform(chunk)
+            save_npz(f"tfidf_chunks_2/X_chunk_{chunk_id}.npz", X)
+
+    print("All chunks vectorized and saved.")
+
+if __name__ == "__main__":
+    #clean()
+    #vectorize()
+    #fit_vectorizer(sample_size=1_000_000)
+    transform_in_chunks(chunk_size=1_000_000)
+
+
+==== ./data_proccesing\slang.py ====
+"""up-to-date list of slangs and abbreviations used in today modern tweets and chat texts from 2020
+source: https://www.kaggle.com/code/nmaguette/up-to-date-list-of-slangs-for-text-preprocessing """
+
+class Slang:
+    abbreviations = {
+        "$" : " dollar ",
+        "€" : " euro ",
+        "4ao" : "for adults only",
+        "a.m" : "before midday",
+        "a3" : "anytime anywhere anyplace",
+        "aamof" : "as a matter of fact",
+        "acct" : "account",
+        "adih" : "another day in hell",
+        "afaic" : "as far as i am concerned",
+        "afaict" : "as far as i can tell",
+        "afaik" : "as far as i know",
+        "afair" : "as far as i remember",
+        "afk" : "away from keyboard",
+        "app" : "application",
+        "approx" : "approximately",
+        "apps" : "applications",
+        "asap" : "as soon as possible",
+        "asl" : "age, sex, location",
+        "atk" : "at the keyboard",
+        "ave." : "avenue",
+        "aymm" : "are you my mother",
+        "ayor" : "at your own risk",
+        "b&b" : "bed and breakfast",
+        "b+b" : "bed and breakfast",
+        "b.c" : "before christ",
+        "b2b" : "business to business",
+        "b2c" : "business to customer",
+        "b4" : "before",
+        "b4n" : "bye for now",
+        "b@u" : "back at you",
+        "bae" : "before anyone else",
+        "bak" : "back at keyboard",
+        "bbbg" : "bye bye be good",
+        "bbc" : "british broadcasting corporation",
+        "bbias" : "be back in a second",
+        "bbl" : "be back later",
+        "bbs" : "be back soon",
+        "be4" : "before",
+        "bfn" : "bye for now",
+        "blvd" : "boulevard",
+        "bout" : "about",
+        "brb" : "be right back",
+        "bros" : "brothers",
+        "brt" : "be right there",
+        "bsaaw" : "big smile and a wink",
+        "btw" : "by the way",
+        "bwl" : "bursting with laughter",
+        "c/o" : "care of",
+        "cet" : "central european time",
+        "cf" : "compare",
+        "cia" : "central intelligence agency",
+        "csl" : "can not stop laughing",
+        "cu" : "see you",
+        "cul8r" : "see you later",
+        "cv" : "curriculum vitae",
+        "cwot" : "complete waste of time",
+        "cya" : "see you",
+        "cyt" : "see you tomorrow",
+        "dae" : "does anyone else",
+        "dbmib" : "do not bother me i am busy",
+        "diy" : "do it yourself",
+        "dm" : "direct message",
+        "dwh" : "during work hours",
+        "e123" : "easy as one two three",
+        "eet" : "eastern european time",
+        "eg" : "example",
+        "embm" : "early morning business meeting",
+        "encl" : "enclosed",
+        "encl." : "enclosed",
+        "etc" : "and so on",
+        "faq" : "frequently asked questions",
+        "fawc" : "for anyone who cares",
+        "fb" : "facebook",
+        "fc" : "fingers crossed",
+        "fig" : "figure",
+        "fimh" : "forever in my heart",
+        "ft." : "feet",
+        "ft" : "featuring",
+        "ftl" : "for the loss",
+        "ftw" : "for the win",
+        "fwiw" : "for what it is worth",
+        "fyi" : "for your information",
+        "g9" : "genius",
+        "gahoy" : "get a hold of yourself",
+        "gal" : "get a life",
+        "gcse" : "general certificate of secondary education",
+        "gfn" : "gone for now",
+        "gg" : "good game",
+        "gl" : "good luck",
+        "glhf" : "good luck have fun",
+        "gmt" : "greenwich mean time",
+        "gmta" : "great minds think alike",
+        "gn" : "good night",
+        "g.o.a.t" : "greatest of all time",
+        "goat" : "greatest of all time",
+        "goi" : "get over it",
+        "gps" : "global positioning system",
+        "gr8" : "great",
+        "gratz" : "congratulations",
+        "gyal" : "girl",
+        "h&c" : "hot and cold",
+        "hp" : "horsepower",
+        "hr" : "hour",
+        "hrh" : "his royal highness",
+        "ht" : "height",
+        "ibrb" : "i will be right back",
+        "ic" : "i see",
+        "icq" : "i seek you",
+        "icymi" : "in case you missed it",
+        "idc" : "i do not care",
+        "idgadf" : "i do not give a damn fuck",
+        "idgaf" : "i do not give a fuck",
+        "idk" : "i do not know",
+        "ie" : "that is",
+        "i.e" : "that is",
+        "ifyp" : "i feel your pain",
+        "IG" : "instagram",
+        "iirc" : "if i remember correctly",
+        "ilu" : "i love you",
+        "ily" : "i love you",
+        "imho" : "in my humble opinion",
+        "imo" : "in my opinion",
+        "imu" : "i miss you",
+        "iow" : "in other words",
+        "irl" : "in real life",
+        "j4f" : "just for fun",
+        "jic" : "just in case",
+        "jk" : "just kidding",
+        "jsyk" : "just so you know",
+        "l8r" : "later",
+        "lb" : "pound",
+        "lbs" : "pounds",
+        "ldr" : "long distance relationship",
+        "lmao" : "laugh my ass off",
+        "lmfao" : "laugh my fucking ass off",
+        "lol" : "laughing out loud",
+        "ltd" : "limited",
+        "ltns" : "long time no see",
+        "m8" : "mate",
+        "mf" : "motherfucker",
+        "mfs" : "motherfuckers",
+        "mfw" : "my face when",
+        "mofo" : "motherfucker",
+        "mph" : "miles per hour",
+        "mr" : "mister",
+        "mrw" : "my reaction when",
+        "ms" : "miss",
+        "mte" : "my thoughts exactly",
+        "nagi" : "not a good idea",
+        "nbc" : "national broadcasting company",
+        "nbd" : "not big deal",
+        "nfs" : "not for sale",
+        "ngl" : "not going to lie",
+        "nhs" : "national health service",
+        "nrn" : "no reply necessary",
+        "nsfl" : "not safe for life",
+        "nsfw" : "not safe for work",
+        "nth" : "nice to have",
+        "nvr" : "never",
+        "nyc" : "new york city",
+        "oc" : "original content",
+        "og" : "original",
+        "ohp" : "overhead projector",
+        "oic" : "oh i see",
+        "omdb" : "over my dead body",
+        "omg" : "oh my god",
+        "omw" : "on my way",
+        "p.a" : "per annum",
+        "p.m" : "after midday",
+        "pm" : "prime minister",
+        "poc" : "people of color",
+        "pov" : "point of view",
+        "pp" : "pages",
+        "ppl" : "people",
+        "prw" : "parents are watching",
+        "ps" : "postscript",
+        "pt" : "point",
+        "ptb" : "please text back",
+        "pto" : "please turn over",
+        "qpsa" : "what happens", #"que pasa",
+        "ratchet" : "rude",
+        "rbtl" : "read between the lines",
+        "rlrt" : "real life retweet",
+        "rofl" : "rolling on the floor laughing",
+        "roflol" : "rolling on the floor laughing out loud",
+        "rotflmao" : "rolling on the floor laughing my ass off",
+        "rt" : "retweet",
+        "ruok" : "are you ok",
+        "sfw" : "safe for work",
+        "sk8" : "skate",
+        "smh" : "shake my head",
+        "sq" : "square",
+        "srsly" : "seriously",
+        "ssdd" : "same stuff different day",
+        "tbh" : "to be honest",
+        "tbs" : "tablespooful",
+        "tbsp" : "tablespooful",
+        "tfw" : "that feeling when",
+        "thks" : "thank you",
+        "tho" : "though",
+        "thx" : "thank you",
+        "tia" : "thanks in advance",
+        "til" : "today i learned",
+        "tl;dr" : "too long i did not read",
+        "tldr" : "too long i did not read",
+        "tmb" : "tweet me back",
+        "tntl" : "trying not to laugh",
+        "ttyl" : "talk to you later",
+        "u" : "you",
+        "u2" : "you too",
+        "u4e" : "yours for ever",
+        "utc" : "coordinated universal time",
+        "w/" : "with",
+        "w/o" : "without",
+        "w8" : "wait",
+        "wassup" : "what is up",
+        "wb" : "welcome back",
+        "wtf" : "what the fuck",
+        "wtg" : "way to go",
+        "wtpa" : "where the party at",
+        "wuf" : "where are you from",
+        "wuzup" : "what is up",
+        "wywh" : "wish you were here",
+        "yd" : "yard",
+        "ygtr" : "you got that right",
+        "ynk" : "you never know",
+        "zzz" : "sleeping bored and tired"
+    }
+
+
+==== ./data_proccesing\__init__.py ====
+
+
+==== ./model\partion_training.py ====
+import os
+import pandas as pd
+import numpy as np
+from scipy.sparse import load_npz
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import classification_report
+from sklearn.linear_model import LogisticRegression
+import joblib
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from scipy.sparse import load_npz, hstack, csr_matrix, vstack
+
+# === CONFIGURATION ===
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+META_DIR = os.path.join(BASE_DIR, "data_proccesing", "meta_chunks")
+TFIDF_DIR = os.path.join(BASE_DIR, "data_proccesing", "tfidf_chunks_2")
+MODEL_OUTPUT_PATH = os.path.join(BASE_DIR, "model", "Pre_trained_model", "sentiment_model.pkl")
+TRAIN_CHUNKS = [3, 34, 55]
+TEST_CHUNKS = [13, 28, 60]
+CLASSES = np.array([0, 1, 2])  # negative, neutral, positive
+
+# === Initialize encoders ===
+subreddit_encoder = LabelEncoder()
+
+# === Fit encoders on all metadata first ===
+print("Fitting encoders on metadata...")
+scores = []
+
+MAX_CHUNKS_FOR_ENCODERS = 64
+chunk_id = 1
+subreddits = set()
+score_minmax = MinMaxScaler()
+
+while chunk_id <= MAX_CHUNKS_FOR_ENCODERS:
+    meta_path = os.path.join(META_DIR, f"meta_chunk_{chunk_id}.csv")
+    if not os.path.exists(meta_path):
+        break
+
+    df = pd.read_csv(meta_path)
+    subreddits.update(df["subreddit"].astype(str).unique())
+    score_minmax.partial_fit(df[["score"]].fillna(0))
+
+    chunk_id += 1
+
+subreddit_encoder.fit(list(subreddits))
+
+def partitial_training():
+    # === Initialize model ===
+    print("Initializing SGDClassifier with partial_fit...")
+    model = SGDClassifier(loss="log_loss", max_iter=5, random_state=42)
+    #model = MultinomialNB()
+    chunk_id = 1
+    n_samples = 0
+
+    while True:
+        chunk_path = os.path.join(TFIDF_DIR, f"X_chunk_{chunk_id}.npz")
+        meta_path = os.path.join(META_DIR, f"meta_chunk_{chunk_id}.csv")
+
+        if not os.path.exists(chunk_path) or not os.path.exists(meta_path):
+            print("path wrong")
+            break
+
+        print(f"Processing chunk {chunk_id}...")
+        X_text = load_npz(chunk_path)
+        df = pd.read_csv(meta_path)
+        y = df["label"].map({"negative": 0, "neutral": 1, "positive": 2})
+
+        valid_mask = y.notnull()
+        y = y[valid_mask].astype(int)
+
+        # Prepare meta features
+        subr = subreddit_encoder.transform(df["subreddit"].astype(str))[valid_mask]
+        score = score_minmax.transform(df["score"].fillna(0).values.reshape(-1, 1))[valid_mask]
+        contro = df["controversiality"].fillna(0).values.reshape(-1, 1)[valid_mask]
+
+        X_meta = csr_matrix(np.hstack([contro]))
+        X = hstack([X_text[valid_mask.values], X_meta])
+
+        if chunk_id == 1:
+            model.partial_fit(X, y, classes=CLASSES)
+        else:
+            model.partial_fit(X, y)
+
+        n_samples += X.shape[0]
+        print(f"Trained on chunk {chunk_id} ({X.shape[0]} samples)")
+        chunk_id += 1
+
+    print(f"Training complete. Total samples seen: {n_samples}")
+
+    # === Save model ===
+    os.makedirs(os.path.dirname(MODEL_OUTPUT_PATH), exist_ok=True)
+    joblib.dump(model, MODEL_OUTPUT_PATH)
+    print(f"Model saved to: {MODEL_OUTPUT_PATH}")
+
+    # === Optional: Evaluate on last chunk ===
+    print("Evaluating model on last chunk...")
+    y_pred = model.predict(X)
+    print(classification_report(y, y_pred, target_names=["negative", "neutral", "positive"]))
+
+def log_regr():
+    print("Loading and combining training chunks...")
+    X_chunks = []
+    y_all = []
+
+    for chunk_id in TRAIN_CHUNKS:
+        tfidf_path = os.path.join(TFIDF_DIR, f"X_chunk_{chunk_id}.npz")
+        meta_path = os.path.join(META_DIR, f"meta_chunk_{chunk_id}.csv")
+        if not os.path.exists(tfidf_path) or not os.path.exists(meta_path):
+            continue
+
+        print(f"  - Loading chunk {chunk_id}")
+        X_text = load_npz(tfidf_path)
+        df = pd.read_csv(meta_path)
+
+        y = df["label"].map({"negative": 0, "neutral": 1, "positive": 2})
+        valid_mask = y.notnull()
+        y = y[valid_mask].astype(int)
+
+        subr = subreddit_encoder.transform(df["subreddit"].astype(str).fillna("unknown"))[valid_mask]
+        score = score_minmax.transform(df["score"].fillna(0).values.reshape(-1, 1))[valid_mask]
+        contro = df["controversiality"].fillna(0).values.reshape(-1, 1)[valid_mask]
+
+        X_meta = csr_matrix(np.hstack([score]))
+        X_combined = hstack([X_text[valid_mask.values], X_meta])
+
+        #X_chunks.append(X_combined)
+        X_chunks.append(X_text[valid_mask.values])
+        y_all.append(y)
+
+    X_train = vstack(X_chunks)
+    y_train = pd.concat(y_all, ignore_index=True)
+    print(f"Training data shape: {X_train.shape}")
+
+    # === Train logistic regression ===
+    print("Training Logistic Regression model...")
+    model = LogisticRegression(
+        max_iter=300,
+        multi_class='multinomial',
+        solver='lbfgs'
+    )
+    model.fit(X_train, y_train)
+
+    # === Load test chunks ===
+    print("Evaluating on test chunks...")
+    X_chunks_test = []
+    y_all_test = []
+
+    for chunk_id in TEST_CHUNKS:
+        tfidf_path = os.path.join(TFIDF_DIR, f"X_chunk_{chunk_id}.npz")
+        meta_path = os.path.join(META_DIR, f"meta_chunk_{chunk_id}.csv")
+        if not os.path.exists(tfidf_path) or not os.path.exists(meta_path):
+            continue
+
+        print(f"  - Loading test chunk {chunk_id}")
+        X_text = load_npz(tfidf_path)
+        df = pd.read_csv(meta_path)
+
+        y = df["label"].map({"negative": 0, "neutral": 1, "positive": 2})
+        valid_mask = y.notnull()
+        y = y[valid_mask].astype(int)
+
+        subr = subreddit_encoder.transform(df["subreddit"].astype(str).fillna("unknown"))[valid_mask]
+        score = score_minmax.transform(df["score"].fillna(0).values.reshape(-1, 1))[valid_mask]
+        contro = df["controversiality"].fillna(0).values.reshape(-1, 1)[valid_mask]
+
+        X_meta = csr_matrix(np.hstack([score]))
+        X_combined = hstack([X_text[valid_mask.values], X_meta])
+
+        #X_chunks_test.append(X_combined)
+        X_chunks_test.append(X_text[valid_mask.values])
+        y_all_test.append(y)
+
+    X_test = vstack(X_chunks_test)
+    y_test = pd.concat(y_all_test, ignore_index=True)
+    print(f"Test data shape: {X_test.shape}")
+
+    # === Evaluate ===
+    y_pred = model.predict(X_test)
+    print("Evaluation on test data:")
+    print(classification_report(y_test, y_pred, target_names=["negative", "neutral", "positive"]))
+
+    # === Save model ===
+    os.makedirs(os.path.dirname(MODEL_OUTPUT_PATH), exist_ok=True)
+    joblib.dump(model, MODEL_OUTPUT_PATH)
+    print(f"Model saved to: {MODEL_OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    log_regr()
+#SGD
+"""Evaluating model on last chunk...
+              precision    recall  f1-score   support
+
+    negative       0.84      0.33      0.47    145093
+     neutral       0.70      0.81      0.75    195051
+    positive       0.73      0.87      0.79    272440
+
+    accuracy                           0.73    612584
+   macro avg       0.75      0.67      0.67    612584
+weighted avg       0.74      0.73      0.70    612584"""
+
+#SGD with features: score, controversiality
+"""Evaluating model on last chunk...
+              precision    recall  f1-score   support
+
+    negative       0.84      0.32      0.47    145093
+     neutral       0.69      0.81      0.75    195051
+    positive       0.72      0.87      0.79    272440
+
+    accuracy                           0.72    612584
+   macro avg       0.75      0.67      0.67    612584
+weighted avg       0.74      0.72      0.70    612584
+"""
+
+#Multinomial
+"""Evaluating model on last chunk...
+              precision    recall  f1-score   support
+
+    negative       0.79      0.60      0.68    145093
+     neutral       0.77      0.65      0.70    195051
+    positive       0.71      0.88      0.78    272440
+
+    accuracy                           0.74    612584
+   macro avg       0.76      0.71      0.72    612584
+weighted avg       0.75      0.74      0.73    612584"""
+
+#Multinomial with features: subreddit, score, controversiality
+"""Evaluating model on last chunk...
+              precision    recall  f1-score   support
+
+    negative       0.76      0.50      0.61    145093
+     neutral       0.62      0.69      0.65    195051
+    positive       0.71      0.78      0.75    272440
+
+    accuracy                           0.69    612584
+   macro avg       0.70      0.66      0.67    612584
+weighted avg       0.70      0.69      0.68    612584"""
+
+#Multinomial with features: subreddit, score, controversiality with tfidf chunks 2
+"""Evaluating model on last chunk...
+              precision    recall  f1-score   support
+
+    negative       0.76      0.51      0.61    145093
+     neutral       0.63      0.69      0.66    195051
+    positive       0.71      0.78      0.75    272440
+
+    accuracy                           0.69    612584
+   macro avg       0.70      0.66      0.67    612584
+weighted avg       0.70      0.69      0.69    612584"""
+
+#Multinomial with features: score, controversiality with tfidf chunks 2
+"""Evaluating model on last chunk...
+              precision    recall  f1-score   support
+
+    negative       0.79      0.60      0.69    145093
+     neutral       0.77      0.66      0.71    195051
+    positive       0.71      0.88      0.79    272440
+
+    accuracy                           0.74    612584
+   macro avg       0.76      0.71      0.73    612584
+weighted avg       0.75      0.74      0.74    612584"""
+
+#Logistic Regression - fitting 3Mil dataset, without features, tfidf chunks 2
+#and tfidf chunks same result
+"""Evaluation on test data:
+              precision    recall  f1-score   support
+
+    negative       0.86      0.84      0.85    724191
+     neutral       0.91      0.90      0.90    917448
+    positive       0.91      0.93      0.92   1358361
+
+    accuracy                           0.90   3000000
+   macro avg       0.89      0.89      0.89   3000000
+weighted avg       0.90      0.90      0.90   3000000"""
+
+
+==== ./model\pipeline.py ====
+import pandas as pd
+import numpy as np
+from scipy.sparse import load_npz, vstack
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+import joblib
+
+
+
+# 1. Load features (vectorized texts) from .npz files
+print("Loading feature matrices...")
+X1 = load_npz("../data_proccesing/data_comments/X_chunk_1.npz")
+X2 = load_npz("../data_proccesing/data_comments/X_chunk_2.npz")
+X = vstack([X1, X2])
+
+# 2. Load meta-data (labels) from .csv files
+print("Loading Meta-Data...")
+df1 = pd.read_csv("../data_proccesing/data_comments/meta_chunk_1.csv")
+df2 = pd.read_csv("../data_proccesing/data_comments/meta_chunk_2.csv")
+df = pd.concat([df1, df2], ignore_index=True)
+
+# 3. Convert text labels to numeric classes
+print("Preparing Labels...")
+y = df["label"].map({"negative": 0, "neutral": 1, "positive": 2})
+
+# 4. Remove invalid rows (e.g., without label)
+valid_mask = y.notnull()
+X = X[valid_mask]
+y = y[valid_mask]
+
+# 5. Split into training and test data
+print("Creating Trainings-/Test-Data...")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# 6. Train the model
+print("Training the model...")
+model = LogisticRegression(
+    max_iter=300, #300
+    multi_class='multinomial', 
+    solver='lbfgs'
+)
+model.fit(X_train, y_train)
+
+# 7. Model evaluation
+print("Evaluation:")
+y_pred = model.predict(X_test)
+print(classification_report(y_test, y_pred, target_names=["negative", "neutral", "positive"]))
+
+# 8. Save the model
+print("Saving the model...")
+joblib.dump(model, "Pre_trained_model/sentiment_model.pkl")
+print(" Model saved as 'sentiment_model.pkl'")
+
+
+""" last results for 300 epochs, 2 chunks
+Evaluation:
+              precision    recall  f1-score   support
+
+    negative       0.85      0.82      0.84     94023
+     neutral       0.90      0.90      0.90    124089
+    positive       0.91      0.92      0.92    181888
+
+    accuracy                           0.89    400000
+   macro avg       0.89      0.88      0.88    400000
+weighted avg       0.89      0.89      0.89    400000
+"""
+
+==== ./model\__init__.py ====
+
+
+==== ./stream_processing\__init__.py ====
+
+
+==== ./web_interface\__init__.py ====
+
+

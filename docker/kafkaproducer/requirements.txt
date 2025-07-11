@@ -1,0 +1,2 @@
+confluent-kafka>=1.7.0
+zstandard>=0.15.0

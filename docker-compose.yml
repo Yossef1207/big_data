@@ -1,0 +1,178 @@
+services:
+  ##############################
+  # Backend (ASGI / Daphne)    #
+  ##############################
+  backend:
+    build: { context: ., dockerfile: docker/backend/Dockerfile }
+    container_name: sentiment_backend
+    ports: ["8000:8000"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+
+  ##############################
+  # Frontend (Vite preview)    #
+  ##############################
+  frontend:
+    build: { context: ., dockerfile: docker/frontend/Dockerfile }
+    container_name: sentiment_frontend
+    ports: ["5173:5173"]
+    depends_on: [ backend ]
+
+
+
+  ########################################
+  # 2) Zookeeper for Kafka              #
+  ########################################
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.9.1
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  ########################################
+  # 3) Kafka Broker                     #
+  ########################################
+  kafka:
+    image: confluentinc/cp-kafka:7.9.1
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: >
+      bash -c "
+        /etc/confluent/docker/run &
+
+        echo 'Waiting for Kafka to be ready...';
+        cub kafka-ready -b kafka:9092 1 60 || exit 1;
+
+        echo 'Creating topics...';
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic raw-reddit-comments --partitions 1 --replication-factor 1;
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic labeled-reddit-comments --partitions 1 --replication-factor 1;
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic keyword_requests --partitions 1 --replication-factor 1;
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic keyword_responses --partitions 1 --replication-factor 1;
+
+        wait
+      "
+
+  ########################################
+  # 4) Reddit Producer                   #
+  ########################################
+  reddit-producer:
+    build:
+      context: .
+      dockerfile: docker/kafkaproducer/Dockerfile
+    container_name: reddit_producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: 1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./data/RC_2019-04.zst:/data/RC_2019-04.zst:ro
+    command: >
+      bash -c "python raw_comm_producer.py --data_path /data/RC_2019-04.zst --message_limit 1000"
+
+  ########################################
+  # 5) Kafka UI (Kafdrop)                #
+  ########################################
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: kafdrop
+    ports:
+      - "9021:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+      SERVER_SERVLET_CONTEXTPATH: "/"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  ########################################
+  # 6) Flink JobManager                  #
+  ########################################
+  jobmanager:
+    build:
+      context: .
+      dockerfile: docker/jobmanager/Dockerfile
+    container_name: jobmanager
+    ports:
+      - "8081:8081"
+      - "6123:6123"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./connectors/flink-connector-kafka_2.12-1.20.0.jar:/opt/flink/lib/flink-connector-kafka_2.12-1.20.0.jar:ro
+      - ./src/data_ingestion/raw_comm_processor.py:/opt/flink/usrlib/raw_comm_processor.py
+      - ./src/data_ingestion/keyword_aggregation_processor.py:/opt/flink/usrlib/keyword_aggregation_processor.py
+      - ./src/data_ingestion/config/slang.py:/opt/flink/usrlib/config/slang.py
+      - ./data/tfidf_vectorizer.pkl:/data/tfidf_vectorizer.pkl
+      - ./data/sentiment_model.pkl:/data/sentiment_model.pkl
+      - ./src/data_ingestion:/workspace/src/data_ingestion
+    command: >
+      bash -c "
+        /opt/flink/bin/jobmanager.sh start-foreground & sleep 10;
+        /opt/flink/bin/flink run -d -py /opt/flink/usrlib/raw_comm_processor.py -C file:///opt/flink/usrlib/flink-sql-connector-kafka-3.3.0-1.20.jar;
+        sleep 5;
+        /opt/flink/bin/flink run -d -py /opt/flink/usrlib/keyword_aggregation_processor.py -C file:///opt/flink/usrlib/flink-sql-connector-kafka-3.3.0-1.20.jar;
+        wait
+      "
+
+  ########################################
+  # 7) Flink TaskManager                 #
+  ########################################
+  taskmanager:
+    build:
+      context: .
+      dockerfile: docker/taskmanager/Dockerfile
+    container_name: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        taskmanager.memory.process.size: 4096m
+    volumes:
+      - ./src/data_ingestion:/workspace/src/data_ingestion
+      - ./connectors/flink-connector-kafka_2.12-1.20.0.jar:/opt/flink/lib/flink-connector-kafka_2.12-1.20.0.jar:ro
+    command: taskmanager
+    deploy:
+      resources:
+        limits:
+          memory: 5g

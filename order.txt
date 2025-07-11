@@ -1,0 +1,9 @@
+docker compose down -v
+docker compose up -d --build
+
+python src/data_ingestion/raw_comm_producer.py --message_limit 100 --data_path data/RC_2019-04.zst --bootstrap_servers localhost:29092
+
+python src\data_ingestion\test_script\key_word_test.py --test-request --keyword1 trump --keyword2 biden
+
+docker compose logs -f backend
+docker compose logs -f frontend

@@ -1,0 +1,29 @@
+# Core PyFlink and streaming dependencies
+apache-flink==1.20.0
+grpcio
+googleapis-common-protos
+
+# Kafka client
+confluent-kafka==2.3.0
+
+# Data processing and ML
+numpy
+pandas==2.0.3
+scikit-learn
+joblib==1.3.2
+
+# Text processing
+nltk==3.8.1
+emoji==2.8.0
+
+# Compression
+zstandard==0.22.0
+
+# Utilities
+requests==2.31.0
+regex
+
+apache-beam
+protobuf
+scipy
+scikit-learn==1.3.2

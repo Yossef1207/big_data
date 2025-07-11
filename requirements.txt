@@ -1,0 +1,47 @@
+django
+djangorestframework
+django-cors-headers
+Django==4.2
+channels==4.1
+confluent-kafka
+six
+daphne
+
+### model
+pandas
+numpy
+scipy
+scikit-learn
+joblib
+### data
+kafka-python
+zstandard
+### preprocessing
+vaderSentiment
+nltk
+emoji
+tqdm
+pyflink
+scipy
+
+# django
+# djangorestframework
+# django-cors-headers
+# Django==4.2
+# channels==4.1
+# confluent-kafka
+# six
+# daphne
+# pandas==2.1.4
+# numpy==1.24.4
+# scipy==1.10.1
+# scikit-learn==1.3.2
+# joblib==1.3.2
+# kafka-python==2.0.2
+# zstandard==0.22.0
+# vaderSentiment==3.3.2
+# nltk==3.8.1
+# emoji==2.10.0
+# tqdm==4.66.2
+# pyflink==1.20.0
+# scipy>=1.7
