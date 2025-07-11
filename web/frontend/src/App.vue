@@ -18,8 +18,10 @@
 
 	const userId = inject("userId");
 
-	onMounted(() => {
-		fetch("http://localhost:8000/api/sentiment/start/", {
+        const backendHost = window.location.hostname;
+
+        onMounted(() => {
+                fetch(`http://${backendHost}:8000/api/sentiment/start/`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({

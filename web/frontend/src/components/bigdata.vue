@@ -90,8 +90,10 @@
 		chartRef.value?.chart?.update();
 	}
 
-	onMounted(() => {
-		socket = new WebSocket(`ws://localhost:8000/ws/sentiment/${userId}/`);
+        const backendHost = window.location.hostname;
+
+        onMounted(() => {
+                socket = new WebSocket(`ws://${backendHost}:8000/ws/sentiment/${userId}/`);
 		socket.onmessage = (e) => {
 			try {
 				addPointFromServer(JSON.parse(e.data));
@@ -103,12 +105,12 @@
 		chartData.value.labels = [];
 		chartData.value.datasets[0].data = [];
 		chartData.value.datasets[1].data = [];
-		await fetch("http://localhost:8000/api/sentiment/stop/", {
+                await fetch(`http://${backendHost}:8000/api/sentiment/stop/`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ user_id: userId }),
 		}).catch(() => {});
-		await fetch("http://localhost:8000/api/sentiment/start/", {
+                await fetch(`http://${backendHost}:8000/api/sentiment/start/`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
