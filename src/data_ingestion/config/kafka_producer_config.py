@@ -13,7 +13,7 @@ KAFKA_BOOTSTRAP_SERVER = "kafka:9092"  # Docker service name
 # for local testing, you can change it to "localhost:29092"
 
 RAW_COM_TOPIC = "raw-reddit-comments"
-LIMIT_MESSAGES = 20
+LIMIT_MESSAGES = 0
 
 DATA_PATH = "/data/RC_2019-04.zst"  # Will be mounted from host
 
@@ -27,6 +27,6 @@ FIELDS_TO_KEEP = [
     "controversiality"
 ]
 
-MIN_TIMESTAMP = 1554076800
-MAX_TIMESTAMP = 1555472130
+MIN_TIMESTAMP = -1 #1554076800
+MAX_TIMESTAMP = -1 #1555472130
 MIN_BODY_LENGTH = 10

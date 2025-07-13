@@ -16,7 +16,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
   name                = "sentiment-vm"
   resource_group_name = var.resource_group_name
   location            = var.location
-  size                = "Standard_B1s"
+  size                = "Standard_B4ms" 
   admin_username      = "azureuser"
   network_interface_ids = [
     azurerm_network_interface.nic.id
@@ -38,6 +38,31 @@ resource "azurerm_linux_virtual_machine" "vm" {
   sku       = "20_04-lts"
   version   = "latest"
   }
+  custom_data = base64encode(<<-EOF
+              #!/bin/bash
+              apt-get update
+              apt-get install -y apt-transport-https ca-certificates curl software-properties-common git
+
+              # Docker installieren
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+              add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+              apt-get update
+              apt-get install -y docker-ce docker-ce-cli containerd.io
+
+              # Docker Compose installieren
+              curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+
+              # Git-Repo klonen (ersetze mit deinem echten Repo-Link)
+              #cd /home/azureuser
+              #git clone git@collaborating.tuhh.de:e-19/teaching/bd25_project_m8_a.git
+
+              # Rechte setzen
+              usermod -aG docker azureuser
+              chown -R azureuser:azureuser /home/azureuser
+              EOF
+  )
+
 }
 
 

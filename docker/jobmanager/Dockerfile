@@ -39,7 +39,8 @@ EOF
 ENV NLTK_DATA=/opt/flink/usrlib/nltk_data
 
 # Flink jobs
-COPY src/data_ingestion/raw_comm_processor.py /opt/flink/usrlib/
+COPY src/data_ingestion/comment_cleaner_processor.py /opt/flink/usrlib/
+COPY src/data_ingestion/sentiment_labeling_processor.py /opt/flink/usrlib/
 COPY src/data_ingestion/keyword_aggregation_processor.py /opt/flink/usrlib/
 
 # Cleanup

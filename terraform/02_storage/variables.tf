@@ -4,7 +4,7 @@ variable "resource_group_name" {
 }
 
 variable "location" {
-  default = "westeurope"
+  default = "eastus"
 }
 
 variable "subscription_id" {

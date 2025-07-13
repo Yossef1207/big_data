@@ -81,7 +81,6 @@ class SentimentConfig(AppConfig):
     name = "sentiment"
 
     def ready(self):
-        # Jeżeli tryb symulacji, odpalamy zawsze symulator
         if getattr(settings, "SIMULATE_DATA", False):
             print("[APPS] SIMULATE_DATA=True, uruchamiam symulator")
             from .simulate_consumer import start_simulator
@@ -152,7 +151,7 @@ def start_kafka_consumer():
 
     try:
         while True:
-            msg = c.poll(1.0)  # wait for a maximum of 1 second
+            msg = c.poll(0.1)  # wait for a maximum of 1 second
             if msg is None:
                 continue
             if msg.error():
@@ -268,7 +267,7 @@ def start_session(user_id: str, keyword1: str, keyword2: str):
                 send_to_kafka("keyword_requests", payload)
 
             # Wait 60s or exit earlier if stop_event is set
-            stop_event.wait(60.0)
+            stop_event.wait(5)
 
     t = Thread(target=_poll, daemon=True)
     sessions[user_id] = {

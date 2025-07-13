@@ -2,10 +2,11 @@ import { createApp } from "vue";
 import App from "./App.vue";
 import router from "./router";
 import "./style/style.scss";
+import { v4 as uuidv4 } from 'uuid';
 
 let userId = localStorage.getItem("sentimentUserId");
 if (!userId) {
-	userId = crypto.randomUUID();
+	userId = uuidv4();
 	localStorage.setItem("sentimentUserId", userId);
 }
 

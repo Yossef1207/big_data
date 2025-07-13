@@ -3,11 +3,12 @@
 	"version": "1.0.0",
 	"private": true,
 	"scripts": {
-		"dev": "vite",
+		"dev": "vite --host 0.0.0.0 --port 5173",
 		"build": "vite build",
 		"preview": "vite preview"
 	},
 	"dependencies": {
+		"uuid": "^9.0.0",
 		"vue": "^3.4.0",
 		"vue-router": "^4.5.1",
 		"chart.js": "^4.1.1",

@@ -1,6 +1,6 @@
 # test_producer.py
 import time
-from config.data_config import *
+from data_ingestion.config.kafka_producer_config import *
 from data_ingestion.raw_comm_producer import RedditCommentProducer
 
 def test_connection(self):
@@ -19,7 +19,7 @@ def run_producer_test():
     # Test configuration
     test_config = {
         'bootstrap_servers': "localhost:29092",
-        'topic': TOPIC_1,
+        'topic': RAW_COM_TOPIC,
         'test_data_path': DATA_PATH
     }
 

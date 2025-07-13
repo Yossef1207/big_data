@@ -50,18 +50,20 @@ def start_kafka_consumer():
             logger.info("[KAFKA] push → %s: %s", user_id, data)
 
             async_to_sync(channel_layer.group_send)(
-                f"sentiment_{user_id}",
-                {
-                    "type": "send_sentiment",
-                    "message": {
-                        "keyword1": data.get("keyword1"),
-                        "value1": data.get("value1"),
-                        "keyword2": data.get("keyword2"),
-                        "value2": data.get("value2"),
-                        "timestamp": data.get("timestamp"),
-                    },
+            f"sentiment_{user_id}",
+            {
+                "type": "send_sentiment",
+                "message": {
+                    "keyword1": data.get("keyword1"),
+                    "value1": data.get("value1"),
+                    "total1":   data.get("total1"),
+                    "keyword2": data.get("keyword2"),
+                    "value2": data.get("value2"),
+                    "total2":   data.get("total2"),
+                    "timestamp": data.get("timestamp"),
                 },
-            )
+            },
+        )
     except KeyboardInterrupt:
         pass
     finally:

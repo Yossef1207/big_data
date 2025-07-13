@@ -1,27 +1,22 @@
 """
-Keyword Aggregation Processor
-
-Author: Veronika Anokhina
-Version: 1
+Keyword Aggregation Processor with Timestamp Range Tracking
 """
 
 import json
 import logging
-from collections import defaultdict
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
-import re
 
-from pyflink.common import SimpleStringSchema, WatermarkStrategy, Time
+from pyflink.common import SimpleStringSchema, WatermarkStrategy
 from pyflink.common.typeinfo import Types
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode, MapFunction
 from pyflink.datastream.connectors.kafka import KafkaRecordSerializationSchema
 from pyflink.datastream.connectors.kafka import KafkaSink, DeliveryGuarantee
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
-from pyflink.datastream.functions import ProcessWindowFunction, KeyedProcessFunction, CoProcessFunction
-from pyflink.datastream.state import MapStateDescriptor
-from pyflink.datastream.window import TumblingProcessingTimeWindows
+from pyflink.datastream.functions import CoProcessFunction
+from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +27,7 @@ KEYWORD_REQUESTS_TOPIC = "keyword_requests"
 LABELED_COMMENTS_TOPIC = "labeled-reddit-comments"
 KEYWORD_RESPONSES_TOPIC = "keyword_responses"
 KAFKA_ENDPOINT = "kafka:9092"
-WINDOW_SIZE_SECONDS = 10
+WINDOW_SIZE_COMMENTS = 3000
 
 
 # ================================================================
@@ -91,41 +86,6 @@ class LabeledComment:
             return None
 
 
-class KeywordRequestToCommentKey(MapFunction):
-    """Convert keyword requests to a format that can be connected with comments"""
-
-    def map(self, value: str) -> str:
-        request = KeywordRequest.from_json(value)
-        if request:
-            return json.dumps({
-                'type': 'request',
-                'user_id': request.user_id,
-                'keyword1': request.keyword1,
-                'keyword2': request.keyword2,
-                'request_time': request.request_time
-            })
-        return json.dumps({'type': 'invalid_request'})
-
-
-class CommentToCommentKey(MapFunction):
-    """Convert comments to a format that can be connected with requests"""
-
-    def map(self, value: str) -> str:
-        comment = LabeledComment.from_json(value)
-        if comment:
-            return json.dumps({
-                'type': 'comment',
-                'id': comment.id,
-                'created_utc': comment.created_utc,
-                'subreddit': comment.subreddit,
-                'score': comment.score,
-                'cleaned_body': comment.cleaned_body,
-                'label': comment.label,
-                'original_length': comment.original_length
-            })
-        return json.dumps({'type': 'invalid_comment'})
-
-
 # ================================================================
 # Keyword Matching and Processing Functions
 # ================================================================
@@ -147,10 +107,8 @@ def check_match(text: str, keyword: str) -> bool:
         # \b ensures we match only at word boundaries
         pattern = rf'\b{re.escape(word)}\b'
         if not re.search(pattern, normalized_text):
-            logger.debug(f"Word '{word}' not found as whole word in '{normalized_text[:50]}…'")
             return False
 
-    logger.debug(f"All words from '{normalized_keyword}' matched in text.")
     return True
 
 
@@ -159,23 +117,59 @@ class KeywordCommentConnector(CoProcessFunction):
 
     def __init__(self):
         self.active_requests_state = None
+        self.keyword_matches_state = None
+        self.timestamp_ranges_state = None
+        self.comment_counter_state = None
+        self.first_comment_timestamp_state = None
+        self.last_comment_timestamp_state = None
 
     def open(self, runtime_context):
-        shared_desc = MapStateDescriptor(
-            "shared_active_requests",
+        # State to store active requests
+        requests_desc = MapStateDescriptor(
+            "active_requests",
             Types.STRING(),
             Types.STRING()
         )
-        self.active_requests_state = runtime_context.get_map_state(shared_desc)
+        self.active_requests_state = runtime_context.get_map_state(requests_desc)
 
-        last_req_desc = MapStateDescriptor(
-            "last_request",
+        # State to accumulate matches for each user-keyword pair
+        matches_desc = MapStateDescriptor(
+            "keyword_matches",
             Types.STRING(),
             Types.STRING()
         )
-        self.last_request_state = runtime_context.get_map_state(last_req_desc)
+        self.keyword_matches_state = runtime_context.get_map_state(matches_desc)
 
-        logger.info("KeywordCommentConnector: Initialized active_requests_state & last_request_state")
+        # State to track timestamp ranges for each user-keyword pair
+        timestamp_ranges_desc = MapStateDescriptor(
+            "timestamp_ranges",
+            Types.STRING(),
+            Types.STRING()
+        )
+        self.timestamp_ranges_state = runtime_context.get_map_state(timestamp_ranges_desc)
+
+        # State to track comment count
+        comment_counter_desc = ValueStateDescriptor(
+            "comment_counter",
+            Types.LONG()
+        )
+        self.comment_counter_state = runtime_context.get_state(comment_counter_desc)
+
+        # State to track first comment timestamp
+        first_timestamp_desc = ValueStateDescriptor(
+            "first_comment_timestamp",
+            Types.LONG()
+        )
+        self.first_comment_timestamp_state = runtime_context.get_state(first_timestamp_desc)
+
+        # State to track last comment timestamp
+        last_timestamp_desc = ValueStateDescriptor(
+            "last_comment_timestamp",
+            Types.LONG()
+        )
+        self.last_comment_timestamp_state = runtime_context.get_state(last_timestamp_desc)
+
+        logger.info("KeywordCommentConnector: Initialized state descriptors with timestamp tracking")
 
     def process_element1(self, value, ctx):
         """Process keyword requests (first stream)"""
@@ -189,11 +183,17 @@ class KeywordCommentConnector(CoProcessFunction):
                     'request_time': data['request_time']
                 }
 
-                # Store request in shared state
+                # Store request in state
                 self.active_requests_state.put(user_id, json.dumps(request_data))
                 logger.info(f"Stored keyword request for user {user_id}: {data['keyword1']}, {data['keyword2']}")
-                self.last_request_state.put('request', json.dumps(request_data))
 
+                # Initialize match counters and timestamp ranges for this user's keywords
+                self._initialize_match_counters(user_id, request_data['keyword1'], request_data['keyword2'])
+                self._initialize_timestamp_ranges(user_id, request_data['keyword1'], request_data['keyword2'])
+
+                # Initialize comment counter if not set
+                if self.comment_counter_state.value() is None:
+                    self.comment_counter_state.update(0)
 
         except Exception as e:
             logger.error(f"Error processing keyword request: {e}")
@@ -206,168 +206,303 @@ class KeywordCommentConnector(CoProcessFunction):
                 comment_body = data['cleaned_body']
                 comment_subreddit = data['subreddit']
                 comment_label = data['label']
-                comment_score = data['score']
-                comment_id = data['id']
+                comment_timestamp = data.get('created_utc', 0)
+
+                # Update comment counter and timestamp tracking
+                current_count = self.comment_counter_state.value() or 0
+                current_count += 1
+                self.comment_counter_state.update(current_count)
+
+                # Track first and last comment timestamps in this window
+                if self.first_comment_timestamp_state.value() is None:
+                    self.first_comment_timestamp_state.update(comment_timestamp)
+                self.last_comment_timestamp_state.update(comment_timestamp)
 
                 # Check against all active requests
-                matches = []
                 if self.active_requests_state:
-                    try:
-                        # Go through each active request
-                        for user_id, request_data_str in self.active_requests_state.items():
-                            if request_data_str:
-                                request_data = json.loads(request_data_str)
-                                keyword1 = request_data.get('keyword1', '')
-                                keyword2 = request_data.get('keyword2', '')
+                    for user_id, request_data_str in self.active_requests_state.items():
+                        if request_data_str:
+                            request_data = json.loads(request_data_str)
+                            keyword1 = request_data.get('keyword1', '')
+                            keyword2 = request_data.get('keyword2', '')
 
-                                # Check keyword1 match
-                                if keyword1 and (check_match(comment_body, keyword1) or
-                                                 check_match(comment_subreddit, keyword1)):
-                                    matches.append({
-                                        'user_id': user_id,
-                                        'keyword': keyword1,
-                                        'label': comment_label,
-                                        'score': comment_score,
-                                        'comment_id': comment_id,
-                                        'subreddit': comment_subreddit
-                                    })
+                            # Check keyword1 match
+                            if keyword1 and (check_match(comment_body, keyword1) or
+                                             check_match(comment_subreddit, keyword1)):
+                                self._record_match(user_id, keyword1, comment_label)
+                                self._update_timestamp_range(user_id, keyword1, comment_timestamp)
+                                logger.debug(f"Match found for {user_id}#{keyword1} at timestamp {comment_timestamp}")
 
-                                # Check keyword2 match
-                                if keyword2 and (check_match(comment_body, keyword2) or
-                                                 check_match(comment_subreddit, keyword2)):
-                                    matches.append({
-                                        'user_id': user_id,
-                                        'keyword': keyword2,
-                                        'label': comment_label,
-                                        'score': comment_score,
-                                        'comment_id': comment_id,
-                                        'subreddit': comment_subreddit
-                                    })
+                            # Check keyword2 match
+                            if keyword2 and (check_match(comment_body, keyword2) or
+                                             check_match(comment_subreddit, keyword2)):
+                                self._record_match(user_id, keyword2, comment_label)
+                                self._update_timestamp_range(user_id, keyword2, comment_timestamp)
+                                logger.debug(f"Match found for {user_id}#{keyword2} at timestamp {comment_timestamp}")
 
-                        logger.debug(f"Found {len(matches)} matches for comment {comment_id}")
-
-                        # Emit matches
-                        for match in matches:
-                            yield json.dumps(match)
-
-                    except Exception as e:
-                        logger.error(f"Error checking matches: {e}")
+                # Check if window is complete
+                if current_count >= WINDOW_SIZE_COMMENTS:
+                    yield from self._process_window_completion()
 
         except Exception as e:
             logger.error(f"Error processing comment: {e}")
 
-
-class SentimentAggregationWindow(ProcessWindowFunction):
-    """Aggregate sentiment matches within time windows"""
-
-    def process(self, key, context, elements):
+    def _process_window_completion(self):
+        """Called when comment window is complete - send results for all active requests"""
         try:
-            logger.info(f"Processing window for key: {key}")
+            first_timestamp = self.first_comment_timestamp_state.value()
+            last_timestamp = self.last_comment_timestamp_state.value()
+            comment_count = self.comment_counter_state.value()
 
-            # Parse key to get user_id and keyword
-            user_id, keyword = key.split('#', 1)
+            logger.info(
+                f"Window completed with {comment_count} comments, timestamp range: {first_timestamp} to {last_timestamp}")
 
-            # Count sentiments
-            sentiment_counts = defaultdict(int)
-            total_matches = 0
-            comment_ids = set()
+            # Send results for all active users
+            if self.active_requests_state:
+                for user_id, request_data_str in self.active_requests_state.items():
+                    if request_data_str:
+                        request_data = json.loads(request_data_str)
+                        result = self._create_result(user_id, request_data)
+                        yield json.dumps(result)
+                        logger.info(f"Sent result for user {user_id}: {result}")
 
-            for match in elements:
-                try:
-                    if isinstance(match, str):
-                        match = json.loads(match)
-                    sentiment_counts[match['label']] += 1
-                    total_matches += 1
-                    comment_ids.add(match['comment_id'])
-                except Exception as e:
-                    logger.warning(f"Failed to parse match: {e}")
+            # Clear match data and timestamp ranges for the next window
+            self._clear_and_reinitialize_matches()
 
-            if total_matches > 0:
-                positive_count = sentiment_counts.get('positive', 0)
-                positive_ratio = positive_count / total_matches
+            # Reset window tracking
+            self.comment_counter_state.update(0)
+            self.first_comment_timestamp_state.clear()
+            self.last_comment_timestamp_state.clear()
 
-                # Create result with additional metadata for debugging
-                result = {
-                    'user_id': user_id,
-                    'keyword': keyword,
-                    'positive_ratio': positive_ratio,
-                    'total_matches': total_matches,
-                    'sentiment_breakdown': dict(sentiment_counts),
-                    'unique_comments': len(comment_ids),
-                    'window_end': context.window().end,
-                    'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-                }
-
-                logger.info(
-                    f"Window result for {user_id}#{keyword}: {positive_ratio:.2%} positive ({total_matches} matches)")
-                yield json.dumps(result)
+            logger.info(f"Reset window counters for next {WINDOW_SIZE_COMMENTS} comments")
 
         except Exception as e:
-            logger.error(f"Error in sentiment aggregation: {e}")
+            logger.error(f"Error in window completion processing: {e}")
 
+    def _initialize_match_counters(self, user_id: str, keyword1: str, keyword2: str):
+        """Initialize match counters for user's keywords"""
+        for keyword in [keyword1, keyword2]:
+            if keyword:
+                key = f"{user_id}#{keyword}"
+                initial_data = {
+                    'positive': 0,
+                    'negative': 0,
+                    'neutral': 0,
+                    'total': 0
+                }
+                self.keyword_matches_state.put(key, json.dumps(initial_data))
 
-class ResultCombiner(KeyedProcessFunction):
-    """Combine results for both keywords of each user and send final response"""
+    def _initialize_timestamp_ranges(self, user_id: str, keyword1: str, keyword2: str):
+        """Initialize timestamp ranges for user's keywords"""
+        for keyword in [keyword1, keyword2]:
+            if keyword:
+                key = f"{user_id}#{keyword}"
+                initial_range = {
+                    'min_timestamp': None,
+                    'max_timestamp': None,
+                }
+                self.timestamp_ranges_state.put(key, json.dumps(initial_range))
 
-    def __init__(self):
-        self.keyword_results_state = None
-        self.last_request_state = None
+    def _record_match(self, user_id: str, keyword: str, label: str):
+        """Record a keyword match"""
+        key = f"{user_id}#{keyword}"
+        match_data = json.loads(self.keyword_matches_state.get(key) or
+                                '{"positive": 0, "negative": 0, "neutral": 0, "total": 0}')
 
-    def open(self, runtime_context):
-        kw_res_desc = MapStateDescriptor(
-            "keyword_results",
-            Types.STRING(),
-            Types.STRING()
-        )
-        self.keyword_results_state = runtime_context.get_map_state(kw_res_desc)
+        # Update match data
+        match_data[label] = match_data.get(label, 0) + 1
+        match_data['total'] += 1
 
-        last_req_desc = MapStateDescriptor(
-            "last_request",
-            Types.STRING(),
-            Types.STRING()
-        )
-        self.last_request_state = runtime_context.get_map_state(last_req_desc)
+        # Store updated data
+        self.keyword_matches_state.put(key, json.dumps(match_data))
 
-        logger.info("ResultCombiner: Initialized keyword_results_state & last_request_state")
+    def _update_timestamp_range(self, user_id: str, keyword: str, comment_timestamp: int):
+        """Update timestamp range for a keyword match"""
+        key = f"{user_id}#{keyword}"
+        timestamp_range = json.loads(self.timestamp_ranges_state.get(key) or
+                                     '{"min_timestamp": null, "max_timestamp": null}')
 
-    def process_element(self, value, ctx):
-        partial = json.loads(value)
-        user_id   = partial['user_id']
-        keyword   = partial['keyword']
-        ratio     = partial['positive_ratio']
+        timestamp_range['min_timestamp'] = min(timestamp_range['min_timestamp'] or comment_timestamp,
+                                               comment_timestamp)
+        timestamp_range['max_timestamp'] = max(timestamp_range['max_timestamp'] or comment_timestamp,
+                                               comment_timestamp)
 
-        self.keyword_results_state.put(keyword, value)
+        self.timestamp_ranges_state.put(key, json.dumps(timestamp_range))
 
-        req_json  = self.last_request_state.get('request')
-        if req_json:
-            req      = json.loads(req_json)
-            kw1, kw2 = req['keyword1'], req['keyword2']
+    def _create_result(self, user_id: str, request_data: dict) -> dict:
+        """Create a result for a user including timestamp ranges"""
+        keyword1 = request_data.get('keyword1', '')
+        keyword2 = request_data.get('keyword2', '')
+
+        value1 = self._calculate_positive_ratio(user_id, keyword1)
+        value2 = self._calculate_positive_ratio(user_id, keyword2)
+
+        # Use the last comment timestamp from this window
+        last_timestamp = self.last_comment_timestamp_state.value()
+        if last_timestamp is not None:
+            max_timestamp_iso = datetime.fromtimestamp(last_timestamp, tz=timezone.utc).isoformat().replace('+00:00',
+                                                                                                            'Z')
         else:
-            keys     = list(self.keyword_results_state.keys())
-            kw1, kw2 = (keys + ["", ""])[:2]
+            max_timestamp_iso = -1
 
-        v1 = v2 = 0.5
+        key1 = f"{user_id}#{keyword1}" if keyword1 else ""
+        key2 = f"{user_id}#{keyword2}" if keyword2 else ""
 
-        res1 = self.keyword_results_state.get(kw1)
-        res2 = self.keyword_results_state.get(kw2)
-        if res1: v1 = json.loads(res1)['positive_ratio']
-        if res2: v2 = json.loads(res2)['positive_ratio']
+        total1 = json.loads(self.keyword_matches_state.get(key1) or '{}').get('total', 0) if key1 else 0
+        total2 = json.loads(self.keyword_matches_state.get(key2) or '{}').get('total', 0) if key2 else 0
 
-        yield json.dumps({
+        result = {
             'user_id': user_id,
-            'keyword1': kw1,
-            'value1'  : v1,
-            'keyword2': kw2,
-            'value2'  : v2,
-            'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-        })
+            'keyword1': keyword1,
+            'value1': value1,
+            'total1': total1,
+            'keyword2': keyword2,
+            'value2': value2,
+            'timestamp': max_timestamp_iso,
+            'total2': total2
+        }
+
+        return result
+
+    def _get_timestamp_range(self, user_id: str, keyword: str) -> dict:
+        """Get timestamp range for a keyword"""
+        if not keyword:
+            return {'min_timestamp': None, 'max_timestamp': None}
+
+        key = f"{user_id}#{keyword}"
+        range_str = self.timestamp_ranges_state.get(key) or '{}'
+
+        try:
+            timestamp_range = json.loads(range_str)
+            return {
+                'min_timestamp': timestamp_range.get('min_timestamp'),
+                'max_timestamp': timestamp_range.get('max_timestamp'),
+            }
+        except Exception as e:
+            logger.error(f"Error getting timestamp range: {e}")
+            return {'min_timestamp': None, 'max_timestamp': None}
+
+    def _clear_and_reinitialize_matches(self):
+        """Clear match data and timestamp ranges, then reinitialize counters for all active requests"""
+        try:
+            # Get all active requests to reinitialize their counters
+            if self.active_requests_state:
+                for user_id, request_data_str in self.active_requests_state.items():
+                    if request_data_str:
+                        request_data = json.loads(request_data_str)
+                        keyword1 = request_data.get('keyword1', '')
+                        keyword2 = request_data.get('keyword2', '')
+
+                        # Reinitialize counters and timestamp ranges for this user's keywords
+                        for keyword in [keyword1, keyword2]:
+                            if keyword:
+                                key = f"{user_id}#{keyword}"
+
+                                # Reset match counters
+                                initial_data = {
+                                    'positive': 0,
+                                    'negative': 0,
+                                    'neutral': 0,
+                                    'total': 0
+                                }
+                                self.keyword_matches_state.put(key, json.dumps(initial_data))
+
+                                # Reset timestamp ranges
+                                initial_range = {
+                                    'min_timestamp': None,
+                                    'max_timestamp': None,
+                                }
+                                self.timestamp_ranges_state.put(key, json.dumps(initial_range))
+
+            logger.info("Reinitialized match counters and timestamp ranges for all active requests")
+        except Exception as e:
+            logger.error(f"Error clearing and reinitializing matches: {e}")
+
+    def _calculate_positive_ratio(self, user_id: str, keyword: str) -> float:
+        """Calculate positive sentiment ratios for a keyword"""
+        try:
+            positivity_score = -1
+
+            key = f"{user_id}#{keyword}"
+            match_data = json.loads(self.keyword_matches_state.get(key) or '{}')
+            total = match_data.get('total', 0)
+            positive = match_data.get('positive', 0)
+            negative = match_data.get('negative', 0)
+            neutral = match_data.get('neutral', 0)
+
+            # Prevent division by zero
+            if total != 0:
+                # Scale: negative = 0, neutral = 0.5, positive = 1
+                weighted_sum = positive * 1 + neutral * 0.5 + negative * 0
+                positivity_score = weighted_sum / total
+
+            logger.info(f"Matched {total} comments for {keyword}")
+
+            return positivity_score
+        except Exception as e:
+            logger.error(f"Error calculating positive ratio: {e}")
+            return 0.5
+
+
+# ================================================================
+# Input Processing Functions
+# ================================================================
+
+class KeywordRequestProcessor(MapFunction):
+    """Process keyword requests"""
+
+    def map(self, value: str) -> str:
+        try:
+            # Try to parse as KeywordRequest
+            request = KeywordRequest.from_json(value)
+            if request:
+                return json.dumps({
+                    'type': 'request',
+                    'user_id': request.user_id,
+                    'keyword1': request.keyword1,
+                    'keyword2': request.keyword2,
+                    'request_time': request.request_time
+                })
+
+            # If parsing fails, mark as invalid
+            return json.dumps({'type': 'invalid_request'})
+
+        except Exception as e:
+            logger.error(f"Error processing request: {e}")
+            return json.dumps({'type': 'invalid_request'})
+
+
+class CommentProcessor(MapFunction):
+    """Process labeled comments"""
+
+    def map(self, value: str) -> str:
+        try:
+            # Try to parse as LabeledComment
+            comment = LabeledComment.from_json(value)
+            if comment:
+                return json.dumps({
+                    'type': 'comment',
+                    'id': comment.id,
+                    'created_utc': comment.created_utc,
+                    'cleaned_body': comment.cleaned_body,
+                    'subreddit': comment.subreddit,
+                    'label': comment.label,
+                    'score': comment.score
+                })
+
+            # If parsing fails, mark as invalid
+            return json.dumps({'type': 'invalid_comment'})
+
+        except Exception as e:
+            logger.error(f"Error processing comment: {e}")
+            return json.dumps({'type': 'invalid_comment'})
 
 
 # ================================================================
 # Main Processor Class
 # ================================================================
 class KeywordAggregationProcessor:
-    """Main processor for keyword-based sentiment aggregation"""
+    """Main processor for keyword-based sentiment aggregation with comment-based windowing"""
 
     def __init__(self,
                  bootstrap_server: str = KAFKA_ENDPOINT,
@@ -384,15 +519,15 @@ class KeywordAggregationProcessor:
         self.env.set_parallelism(1)
         self.env.enable_checkpointing(30000)  # 30 seconds
 
-        logger.info("Initialized Keyword Aggregation Processor")
+        logger.info("Initialized Keyword Aggregation Processor with Timestamp Tracking")
 
     def _create_kafka_source(self, topic: str) -> KafkaSource:
-        """Create Kafka source for given topic"""
+        """Create a Kafka source for a given topic"""
         return KafkaSource.builder() \
             .set_bootstrap_servers(self.bootstrap_server) \
             .set_topics(topic) \
             .set_value_only_deserializer(SimpleStringSchema()) \
-            .set_starting_offsets(KafkaOffsetsInitializer.earliest()) \
+            .set_starting_offsets(KafkaOffsetsInitializer.latest())\
             .build()
 
     def _create_kafka_sink(self, topic: str) -> KafkaSink:
@@ -425,36 +560,26 @@ class KeywordAggregationProcessor:
                 requests_source,
                 WatermarkStrategy.no_watermarks(),
                 "Keyword_Requests_Source"
-            ).map(KeywordRequestToCommentKey())
+            ).map(KeywordRequestProcessor(), output_type=Types.STRING())
 
             # Stream 2: Labeled comments
             comments_stream = self.env.from_source(
                 comments_source,
                 WatermarkStrategy.no_watermarks(),
                 "Labeled_Comments_Source"
-            ).map(CommentToCommentKey())
+            ).map(CommentProcessor(), output_type=Types.STRING())
 
-            # Connect streams to find keyword matches
-            matches_stream = requests_stream \
+            # Connect streams using CoProcessFunction
+            connected_stream = requests_stream \
                 .key_by(lambda x: "global") \
                 .connect(comments_stream.key_by(lambda x: "global")) \
-                .process(KeywordCommentConnector())
+                .process(KeywordCommentConnector(), output_type=Types.STRING())
 
-            # Window aggregation by user_id#keyword
-            #TODO timer
-            windowed_results = matches_stream \
-                .map(lambda x: json.loads(x)) \
-                .key_by(lambda match: f"{match['user_id']}#{match['keyword']}") \
-                .window(TumblingProcessingTimeWindows.of(Time.seconds(WINDOW_SIZE_SECONDS))) \
-                .process(SentimentAggregationWindow(), output_type=Types.STRING())
+            # Debug: Print results before sinking
+            connected_stream.print("Result")
 
-            # Combine results for each user
-            final_responses = windowed_results \
-                .key_by(lambda x: json.loads(x)['user_id']) \
-                .process(ResultCombiner(), output_type=Types.STRING())
-
-            # Send to response topic
-            final_responses.sink_to(responses_sink)
+            # Send to a response topic
+            connected_stream.sink_to(responses_sink)
 
             # Execute job
             job_name = job_name or "KeywordAggregationProcessor"
@@ -469,9 +594,9 @@ class KeywordAggregationProcessor:
 def main():
     """Main entry point"""
     try:
-        logger.info("Starting Keyword Aggregation Processor")
+        logger.info("Starting Keyword Aggregation Processor with Comment-Based Windows")
         logger.info(f"Kafka endpoint: {KAFKA_ENDPOINT}")
-        logger.info(f"Window size: {WINDOW_SIZE_SECONDS} seconds")
+        logger.info(f"Window size: {WINDOW_SIZE_COMMENTS} comments")
 
         processor = KeywordAggregationProcessor()
         processor.run()

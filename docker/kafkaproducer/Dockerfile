@@ -14,7 +14,7 @@ RUN pip install --upgrade pip \
 
 # 3) App
 COPY src/data_ingestion/raw_comm_producer.py .
-COPY src/data_ingestion/config/ ./config/
+COPY src/data_ingestion/config/kafka_producer_config.py ./config/
 
 # 4) Verify
 RUN python -c "import confluent_kafka, zstandard"

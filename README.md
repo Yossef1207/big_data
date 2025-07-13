@@ -17,6 +17,8 @@ project-root/
 │
 ├── docker/         #Dockerfiles
 │
+│── terraform/
+│
 └── README.md           # Project documentation
 
 ```
@@ -38,7 +40,35 @@ This Docker Compose configuration creates a local streaming pipeline with Kafka 
    - Includes necessary Kafka connectors
 
 ## Getting Started
-   
+
+## Cloud Infrastructure Access & Deployment
+
+The cloud infrastructure is fully provisioned and ready for use. To access the deployed environment, please follow these steps:
+
+1. **Connect to the Azure Virtual Machine**
+
+   You will need the private SSH key and the public IP address, **which can be obtained from the development team via Email**. Use the following command to establish an SSH connection:
+
+   ```sh
+   ssh -i ./.ssh/id_rsa azureuser@<ip_address> 
+   ssh -i ./.ssh/id_rsa azureuser@52.224.0.84 # current command with the correct IP address
+   ```
+
+   > **Note:** Replace `<ip_address>` with the actual public IP of the VM. The IP-Address might change, but right now it is ``52.224.0.84``.
+
+2. **Start the Docker Services**
+
+   Once connected to the VM, initialize all required containers by running:
+
+   ```sh
+   docker compose up -d --build
+   ```
+
+This will launch all necessary services, including Kafka, Flink, and supporting components, as defined in the Docker Compose configuration.
+
+3. **Call the service**:
+   to call the service call the following link ``http://52.224.0.84:5173`` in the browser and type 2 keywords as described in [here](./frontend/README.md). The sentiment analysis results will be displayed as a graph, with timestamps on the x-axis and sentiment levels on the y.
+
 ## Description
 
 ## Installation

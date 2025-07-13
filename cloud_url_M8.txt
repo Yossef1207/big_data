@@ -1,0 +1,3 @@
+http://52.224.0.84:5173
+
+# this will be active on Wednesday: July 23 from 9:00 to 17:00

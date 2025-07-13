@@ -91,3 +91,33 @@ The script will then destroy the entire infrastructure in the correct order.
 
 **Note:**  
 This script is intended for Windows operating systems. For Linux/MacOS, use a shell script (`.sh`) instead.
+
+
+# SetUp
+
+```shell
+scp -i .\.ssh\id_rsa .\.ssh\id_rsa azureuser@52.224.0.84:~/.ssh/
+ssh -i .\.ssh\id_rsa azureuser@<ip_address>
+# then 
+ssh -i .\.ssh\id_rsa azureuser@52.224.0.84
+# then
+chmod 600 ~/.ssh/id_rsa
+git clone git@collaborating.tuhh.de:e-19/teaching/bd25_project_m8_a.git
+git switch <branch>
+---
+docker compose down -v
+docker compose up -d --build
+python src/data_ingestion/raw_comm_producer.py --message_limit 100 --data_path data/RC_2019-04.zst --bootstrap_servers localhost:29092
+python src\data_ingestion\test_script\key_word_test.py --test-request --keyword1 trump --keyword2 biden
+docker compose logs -f backend
+docker compose logs -f frontend
+```
+In the VM run: 
+```shell
+chmod 600 ~/.ssh/id_rsa
+git clone git@collaborating.tuhh.de:e-19/teaching/bd25_project_m8_a.git
+cd bd25_project_m8_a/data 
+sudo apt update
+sudo apt install aria2
+aria2c -c -x 16 -s 16 -o RC_2019-04.zst "https://zenodo.org/record/3608135/files/RC_2019-04.zst?download=1"
+```
